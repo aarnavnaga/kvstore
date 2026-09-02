@@ -1,0 +1,15 @@
+/build*/
+/.cache/
+compile_commands.json
+*.swp
+.DS_Store
+/data/
+/fuzz/corpus-*/
+crash-*
+leak-*
+timeout-*
+/bench/results/raw/
+/chaos/out/
+/client-java/target/
+/deploy/certs/
+__pycache__/
