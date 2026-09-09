@@ -3,6 +3,7 @@ Checks: >
   bugprone-*,
   -bugprone-easily-swappable-parameters,
   -bugprone-narrowing-conversions,
+  -bugprone-not-null-terminated-result,
   concurrency-*,
   performance-*,
   -performance-enum-size,

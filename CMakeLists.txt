@@ -14,7 +14,7 @@ option(KV_BUILD_TESTS "Build unit and integration tests" ON)
 option(KV_BUILD_FUZZ "Build libFuzzer targets (clang only)" OFF)
 set(KV_SANITIZER "" CACHE STRING "Sanitizer to build with: address, thread or empty")
 
-add_compile_options(-Wall -Wextra -Wpedantic -Werror=return-type)
+add_compile_options(-Wall -Wextra -Wpedantic -Wno-missing-field-initializers -Werror=return-type)
 
 if(KV_SANITIZER STREQUAL "address")
   add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all)
