@@ -32,6 +32,18 @@ struct Options {
   // only so the benchmark can measure the difference.
   bool group_commit = true;
   size_t max_group_bytes = 1 << 20;
+
+  // Size-tiered compaction: merge a run of at least compaction_min_tables tables (and at
+  // most compaction_max_tables) that are adjacent in age and within
+  // [bucket_low, bucket_high] x the run's average size.
+  bool background_compaction = true;
+  int compaction_min_tables = 4;
+  int compaction_max_tables = 16;
+  double bucket_low = 0.5;
+  double bucket_high = 1.5;
+  // Compact everything when tombstones make up this fraction of all table entries, so
+  // space freed by mass deletes is reclaimed even when table sizes do not line up.
+  double tombstone_ratio = 0.3;
 };
 
 struct DBStats {
@@ -41,6 +53,9 @@ struct DBStats {
   uint64_t flushes = 0;
   uint64_t wal_syncs = 0;
   uint64_t writes = 0;
+  uint64_t compactions = 0;
+  uint64_t compaction_bytes_read = 0;
+  uint64_t compaction_bytes_written = 0;
 };
 
 // DB is a single-node LSM-tree key-value store.
@@ -71,6 +86,10 @@ class DB {
   // Flush forces the current memtable to an SSTable and waits for it.
   Status Flush();
 
+  // CompactAll flushes the memtable, then merges every table into one, dropping
+  // tombstones and shadowed values. Blocks until done.
+  Status CompactAll();
+
   DBStats GetStats();
   [[nodiscard]] const std::string& dir() const { return dir_; }
 
@@ -79,6 +98,13 @@ class DB {
     std::vector<std::shared_ptr<Table>> tables;  // newest first
   };
   struct Writer;
+  // Compaction describes a run of tables, adjacent in age, to merge into one.
+  struct Compaction {
+    std::vector<std::shared_ptr<Table>> inputs;  // newest first
+    // Only a run that includes the oldest table may drop tombstones: anywhere else, an
+    // older table outside the run could still hold the value the tombstone shadows.
+    bool drop_tombstones = false;
+  };
 
   DB(const Options& options, std::string dir);
 
@@ -88,6 +114,8 @@ class DB {
   // WriteTable writes the entries of iter to a new SSTable file and opens it.
   Status WriteTable(Iterator* iter, uint64_t number, std::shared_ptr<Table>* table);
   Status InstallManifest(const Version& v, uint64_t log_number);
+  // LiveLogNumber is the oldest WAL still holding writes that are not in a table.
+  [[nodiscard]] uint64_t LiveLogNumber() const { return imm_ ? imm_wal_number_ : wal_number_; }
   void RemoveObsoleteFiles();
 
   Status WriteInternal(WriteBatch* batch, bool force_flush);
@@ -97,13 +125,19 @@ class DB {
   void BackgroundLoop();
   void FlushImmutable(std::unique_lock<std::mutex>& lk);
 
+  void CompactionLoop();
+  // PickCompaction chooses the next run to merge, or returns false if none is due.
+  bool PickCompaction(bool full, Compaction* c) const;
+  Status RunCompaction(std::unique_lock<std::mutex>& lk, const Compaction& c);
+
   const Options options_;
   const std::string dir_;
   int lock_fd_ = -1;
 
   std::mutex mu_;
   std::condition_variable bg_cv_;    // wakes the background thread
-  std::condition_variable done_cv_;  // signals a finished flush
+  std::condition_variable done_cv_;  // signals a finished flush or compaction
+  std::condition_variable compact_cv_;
   std::shared_ptr<MemTable> mem_;
   std::shared_ptr<MemTable> imm_;
   std::shared_ptr<const Version> version_;
@@ -117,8 +151,11 @@ class DB {
   WriteBatch group_batch_;
   Status bg_error_;
   bool shutting_down_ = false;
+  bool compacting_ = false;
+  bool full_compaction_requested_ = false;
   DBStats stats_;
   std::thread bg_thread_;
+  std::thread compact_thread_;
 };
 
 }  // namespace kv::storage

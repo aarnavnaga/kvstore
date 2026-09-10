@@ -91,6 +91,56 @@ The crash test runs a writer process that prints each operation only after the s
 acknowledges it, `SIGKILL`s it at a random moment, reopens the store and checks every
 acknowledged put and delete, for 25 rounds against the same directory.
 
+## Compaction (M2)
+
+Every flush adds a table, and every table is one more place a read may have to look.
+Compaction merges tables to bound that read amplification and to reclaim the space held
+by overwritten values and tombstones.
+
+**Size-tiered, not leveled.** A run of 4 to 16 tables of similar size (each within 0.5x
+to 1.5x of the run's average) is merged into one. Flushes produce equal-sized tables, so
+four of them merge into a 4x table, four of those into a 16x table, and so on: the table
+count grows with the logarithm of the data size, and each byte is rewritten about
+log4(N) times. Leveled compaction (LevelDB, RocksDB's default) gives lower read and space
+amplification at the cost of more write amplification. This store's reads are dominated
+by the memtable and the bloom filters, while every write is already paid for twice (Raft
+log plus WAL), so tiering is the better trade here. Leveled is a stretch goal.
+
+**Only runs that are adjacent in age.** Reads search tables newest-first and stop at the
+first hit, so the table order *is* the version order. Merging table 1 with table 3 and
+putting the output at position 1 would let table 3's stale value shadow table 2's newer
+one. Picking only contiguous runs, and putting the output exactly where the run was,
+keeps the order meaningful without storing sequence numbers in SSTables.
+
+**Tombstones are dropped only when the run includes the oldest table.** A tombstone
+exists to hide older values of its key. If any table older than the run might still
+hold such a value, dropping the tombstone would resurrect it.
+
+**A tombstone-ratio trigger.** Size-tiering alone never merges a small table of
+tombstones into the big table holding the data they delete, so a mass delete would not
+free space. When tombstones make up 30% of all entries, the store compacts everything
+into one table, dropping both the tombstones and the values they shadow.
+
+**Concurrency.** Compaction has its own thread so a long merge never blocks a flush (a
+blocked flush would stall writers). The merge runs without the DB mutex: its inputs are
+immutable and pinned by `shared_ptr`. Only installing the result takes the lock. Flushes
+may have prepended tables in the meantime, but nothing else can change the run, so it is
+still contiguous and is replaced in place. Readers holding the old version keep their
+tables mapped until they finish, even though the files are already unlinked.
+
+**Crash safety.** The output table is fully written and synced before the MANIFEST that
+references it is atomically swapped in, and the inputs are deleted only after that. A
+crash mid-compaction leaves an orphaned output file that recovery deletes. The crash test
+uses a 16 KB memtable, so its kills regularly land during flushes and compactions.
+
+**Results** (`tests/compaction_test.cc`):
+
+| Check | Result |
+|---|---|
+| 40k keys deleted, background compaction only | 8.6 MB on disk to 32 bytes (just the MANIFEST) |
+| 308 flushes of random overwrites | 98 compactions, peak of 12 live tables |
+| 4 readers during constant compaction | no key ever missing, no value ever older than one already seen |
+
 ## Bug log
 
 | # | Milestone | Symptom | Cause | Caught by |
