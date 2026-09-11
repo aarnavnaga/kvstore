@@ -112,6 +112,7 @@ Status DB::Open(const Options& options, const std::string& dir, std::unique_ptr<
 
   KV_RETURN_IF_ERROR(db->Recover());
   db->bg_thread_ = std::thread(&DB::BackgroundLoop, db.get());
+  db->compact_thread_ = std::thread(&DB::CompactionLoop, db.get());
   *out = std::move(db);
   return Status::OK();
 }
@@ -122,8 +123,12 @@ DB::~DB() {
     shutting_down_ = true;
   }
   bg_cv_.notify_all();
+  compact_cv_.notify_all();
   if (bg_thread_.joinable()) {
     bg_thread_.join();
+  }
+  if (compact_thread_.joinable()) {
+    compact_thread_.join();
   }
   if (wal_) {
     (void)wal_->Close();
@@ -270,7 +275,7 @@ void DB::RemoveObsoleteFiles() {
   for (const auto& t : version_->tables) {
     live.push_back(t->number());
   }
-  const uint64_t min_log = imm_ ? imm_wal_number_ : wal_number_;
+  const uint64_t min_log = LiveLogNumber();
 
   std::vector<std::string> names;
   if (!ListDir(dir_, &names).ok()) {
@@ -480,18 +485,175 @@ void DB::FlushImmutable(std::unique_lock<std::mutex>& lk) {
     v->tables.insert(v->tables.begin(), table);
     // Every write in the immutable memtable's WAL is now in the table, so the oldest
     // log recovery needs is the current one.
-    s = InstallManifest(*v, wal_number_);
+    s = InstallManifest(*v, wal_number_);  // imm_'s log is no longer needed
     if (s.ok()) {
       version_ = std::move(v);
       imm_.reset();
       ++stats_.flushes;
       RemoveObsoleteFiles();
+      compact_cv_.notify_one();
     }
   }
   if (!s.ok()) {
     bg_error_ = s;
   }
   done_cv_.notify_all();
+}
+
+// ---------------------------------------------------------------------------------------
+// Compaction
+
+Status DB::CompactAll() {
+  KV_RETURN_IF_ERROR(Flush());
+  std::unique_lock lk(mu_);
+  // Wait out any compaction already running, then run the full one on this thread so
+  // the caller knows exactly when it finished.
+  done_cv_.wait(lk, [&] { return !compacting_ || !bg_error_.ok(); });
+  KV_RETURN_IF_ERROR(bg_error_);
+  Compaction c;
+  if (!PickCompaction(true, &c)) {
+    return Status::OK();
+  }
+  compacting_ = true;
+  Status s = RunCompaction(lk, c);
+  compacting_ = false;
+  done_cv_.notify_all();
+  compact_cv_.notify_one();
+  return s;
+}
+
+void DB::CompactionLoop() {
+  std::unique_lock lk(mu_);
+  while (true) {
+    Compaction c;
+    compact_cv_.wait(lk, [&] {
+      return shutting_down_ || (!compacting_ && bg_error_.ok() && options_.background_compaction &&
+                                PickCompaction(false, &c));
+    });
+    if (shutting_down_) {
+      return;
+    }
+    compacting_ = true;
+    const Status s = RunCompaction(lk, c);
+    compacting_ = false;
+    if (!s.ok()) {
+      bg_error_ = s;
+    }
+    done_cv_.notify_all();
+  }
+}
+
+bool DB::PickCompaction(bool full, Compaction* c) const {
+  const auto& tables = version_->tables;
+  c->inputs.clear();
+  c->drop_tombstones = false;
+  if (tables.empty()) {
+    return false;
+  }
+
+  uint64_t entries = 0;
+  uint64_t tombstones = 0;
+  for (const auto& t : tables) {
+    entries += t->num_entries();
+    tombstones += t->num_tombstones();
+  }
+  // Rewriting a lone table only pays off if it has tombstones to drop.
+  const bool tombstone_heavy =
+      entries > 0 && static_cast<double>(tombstones) >= options_.tombstone_ratio * entries &&
+      (tables.size() > 1 || tombstones > 0);
+  if (full || tombstone_heavy) {
+    if (tables.size() == 1 && tables[0]->num_tombstones() == 0) {
+      return false;
+    }
+    c->inputs = tables;
+    c->drop_tombstones = true;
+    return true;
+  }
+
+  // Size-tiered: walk newest to oldest, growing a run while each table's size stays
+  // within the bucket around the run's average. Flushes produce similar-sized tables at
+  // the head, so those runs form naturally; merged outputs then form the next tier.
+  const auto min_run = static_cast<size_t>(std::max(2, options_.compaction_min_tables));
+  const auto max_run = static_cast<size_t>(std::max(2, options_.compaction_max_tables));
+  size_t start = 0;
+  while (start < tables.size()) {
+    double total = static_cast<double>(tables[start]->file_size());
+    size_t end = start + 1;
+    while (end < tables.size() && end - start < max_run) {
+      const double avg = total / static_cast<double>(end - start);
+      const auto size = static_cast<double>(tables[end]->file_size());
+      if (size < avg * options_.bucket_low || size > avg * options_.bucket_high) {
+        break;
+      }
+      total += size;
+      ++end;
+    }
+    if (end - start >= min_run) {
+      c->inputs.assign(tables.begin() + static_cast<std::ptrdiff_t>(start),
+                       tables.begin() + static_cast<std::ptrdiff_t>(end));
+      c->drop_tombstones = end == tables.size();
+      return true;
+    }
+    start = end;
+  }
+  return false;
+}
+
+Status DB::RunCompaction(std::unique_lock<std::mutex>& lk, const Compaction& c) {
+  const uint64_t number = next_file_number_++;
+  pending_outputs_.insert(number);
+  uint64_t bytes_read = 0;
+  for (const auto& t : c.inputs) {
+    bytes_read += t->file_size();
+  }
+
+  // Merge without the lock: inputs are immutable and kept alive by the shared_ptrs in c.
+  lk.unlock();
+  std::vector<std::unique_ptr<Iterator>> children;
+  children.reserve(c.inputs.size());
+  for (const auto& t : c.inputs) {
+    children.push_back(t->NewIterator());
+  }
+  std::unique_ptr<Iterator> merged = NewMergingIterator(std::move(children));
+  if (c.drop_tombstones) {
+    merged = NewLiveIterator(std::move(merged));
+  }
+  merged->SeekToFirst();
+  const bool empty = merged->Valid() == false;
+  Status s = merged->status();
+  std::shared_ptr<Table> output;
+  if (s.ok() && !empty) {
+    s = WriteTable(merged.get(), number, &output);
+  }
+  lk.lock();
+  pending_outputs_.erase(number);
+  if (!s.ok()) {
+    return s;
+  }
+
+  // Flushes may have prepended newer tables meanwhile, but nothing else changes the
+  // version while compacting_ is set, so the inputs are still a contiguous run.
+  auto v = std::make_shared<Version>();
+  const uint64_t first = c.inputs.front()->number();
+  for (size_t i = 0; i < version_->tables.size();) {
+    const auto& t = version_->tables[i];
+    if (t->number() == first) {
+      if (output) {
+        v->tables.push_back(output);
+      }
+      i += c.inputs.size();
+      continue;
+    }
+    v->tables.push_back(t);
+    ++i;
+  }
+  KV_RETURN_IF_ERROR(InstallManifest(*v, LiveLogNumber()));
+  version_ = std::move(v);
+  ++stats_.compactions;
+  stats_.compaction_bytes_read += bytes_read;
+  stats_.compaction_bytes_written += output ? output->file_size() : 0;
+  RemoveObsoleteFiles();
+  return Status::OK();
 }
 
 // ---------------------------------------------------------------------------------------
