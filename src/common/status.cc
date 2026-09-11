@@ -5,11 +5,12 @@
 
 namespace kv {
 
+std::string ErrnoString(int err) { return std::error_code(err, std::generic_category()).message(); }
+
 Status Status::IOErrorFromErrno(std::string_view context) {
   std::string msg(context);
   msg += ": ";
-  // error_code::message is thread-safe, unlike strerror.
-  msg += std::error_code(errno, std::generic_category()).message();
+  msg += ErrnoString(errno);
   return IOError(msg);
 }
 

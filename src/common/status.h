@@ -50,6 +50,9 @@ class Status {
   std::string msg_;
 };
 
+// ErrnoString describes an errno value. Unlike strerror it is thread-safe.
+std::string ErrnoString(int err);
+
 }  // namespace kv
 
 // KV_RETURN_IF_ERROR propagates a non-OK Status to the caller.
