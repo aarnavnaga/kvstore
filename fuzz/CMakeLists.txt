@@ -1,0 +1,5 @@
+foreach(target frame_fuzzer wal_fuzzer sstable_fuzzer)
+  add_executable(${target} ${target}.cc)
+  target_link_libraries(${target} PRIVATE kv_net kv_storage)
+  target_link_options(${target} PRIVATE -fsanitize=fuzzer)
+endforeach()
