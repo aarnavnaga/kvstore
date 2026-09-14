@@ -43,9 +43,9 @@ int main(int argc, char** argv) {
   server_options.port = port;
   server_options.io_threads = static_cast<int>(flags.GetInt("io_threads", 2));
   server_options.worker_threads = static_cast<int>(flags.GetInt("workers", 8));
-  kv::net::Server server(server_options, [&service](kv::net::Frame f, kv::net::Responder r) {
-    service.Handle(std::move(f), r);
-  });
+  kv::net::Server server(
+      server_options,
+      [&service](const kv::net::Frame& f, const kv::net::Responder& r) { service.Handle(f, r); });
   s = server.Start();
   if (!s.ok()) {
     std::fprintf(stderr, "start server: %s\n", s.ToString().c_str());

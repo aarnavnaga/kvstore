@@ -109,8 +109,8 @@ class ServerTest : public ::testing::Test {
 
   void StartServer(ServerOptions options = {}) {
     options.host = "127.0.0.1";
-    server_ = std::make_unique<Server>(
-        options, [this](Frame f, Responder r) { service_->Handle(std::move(f), r); });
+    server_ =
+        std::make_unique<Server>(options, [this](Frame f, Responder r) { service_->Handle(f, r); });
     ASSERT_TRUE(server_->Start().ok());
     addr_ = "127.0.0.1:" + std::to_string(server_->port());
   }

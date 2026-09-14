@@ -4,7 +4,7 @@
 
 namespace kv::server {
 
-void StandaloneService::Handle(net::Frame request, const net::Responder& respond) {
+void StandaloneService::Handle(const net::Frame& request, const net::Responder& respond) {
   net::Frame response;
   response.type = net::MsgType::kResponse;
 

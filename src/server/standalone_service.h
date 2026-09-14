@@ -12,7 +12,7 @@ class StandaloneService {
  public:
   explicit StandaloneService(storage::DB* db) : db_(db) {}
 
-  void Handle(net::Frame request, const net::Responder& respond);
+  void Handle(const net::Frame& request, const net::Responder& respond);
 
  private:
   storage::DB* db_;

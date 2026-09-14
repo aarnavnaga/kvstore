@@ -35,7 +35,7 @@ fmt-check:
 	$(RUN) sh -c "find src tests fuzz bench chaos \( -name '*.cc' -o -name '*.h' \) | xargs -r clang-format --dry-run --Werror"
 
 tidy: build-release
-	$(RUN) sh -c "find src -name '*.cc' | xargs -r clang-tidy -p build/release --quiet"
+	$(RUN) sh -c "find src -name '*.cc' | xargs -r clang-tidy -p build/release --quiet --use-color=false"
 
 shell:
 	$(DOCKER) run --rm -it -v $(CURDIR):/src -w /src $(IMAGE) bash
