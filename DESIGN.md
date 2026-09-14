@@ -141,9 +141,63 @@ uses a 16 KB memtable, so its kills regularly land during flushes and compaction
 | 308 flushes of random overwrites | 98 compactions, peak of 12 live tables |
 | 4 readers during constant compaction | no key ever missing, no value ever older than one already seen |
 
+## Networking (M3)
+
+**One wire format for clients and peers.** Every message is a frame:
+`u32 length | u8 type | u64 request_id | payload`. A length prefix lets the reader size its
+buffer once and never scan payload bytes for a delimiter, and the decoder checks the
+length against a limit (64 MB) *before* buffering the body, so a hostile client cannot
+make the server allocate gigabytes by sending four bytes. The request id is echoed in the
+response, so one connection can have many requests in flight and responses can arrive
+out of order. Hand-written rather than Protocol Buffers because the format is five fields
+and the decoder is the thing being fuzzed.
+
+**epoll, not a thread per connection.** A thread per connection costs a stack (8 MB of
+virtual memory, ~10s of KB resident) and a context switch per request; at 10,000
+connections the scheduler, not the store, becomes the bottleneck. Here an accept thread
+hands sockets round-robin to a few event-loop threads, each owning its connections and
+one `epoll` set. Loops do only non-blocking reads, frame decoding and writes; request
+handling runs on a worker pool, so a slow request never stalls the other connections on
+its loop.
+
+**Asynchronous responses.** A handler gets the request and a `Responder` callback, and may
+call it from any thread at any later time. That shape exists for Raft: a write is
+answered only after its log entry commits, which is a different thread, milliseconds
+later. The responder posts the encoded response to the owning loop through a mutex-guarded
+queue and an `eventfd` wakeup, so a socket is only ever touched by its loop thread.
+Responders hold `weak_ptr`s to the connection and the loop: a response for a client that
+already hung up, or that completes after shutdown, is silently dropped rather than
+written to a recycled file descriptor or a destroyed loop.
+
+**Backpressure and hygiene.** Responses that do not fit in the socket buffer wait in a
+per-connection queue and `EPOLLOUT` is armed only while it is non-empty (level-triggered
+`EPOLLOUT` on an idle socket would spin the loop). A client that stops reading is cut off
+once 64 MB is queued for it. Sockets are `SOCK_CLOEXEC` and `TCP_NODELAY` (requests are
+small and latency-bound; Nagle would add up to 40 ms), and writes use `MSG_NOSIGNAL` so a
+peer that vanished produces `EPIPE`, not a process-killing `SIGPIPE`.
+
+**Client sessions for exactly-once writes.** Writes carry `(client_id, seq)`; a retry of
+the same logical write reuses its `seq`. This is unused by the single-node server but is
+designed in now because M7's linearizability check depends on it: if a client's write
+times out but actually committed, and the client retries after another client has
+written the same key, a naive server applies the old write a second time and a reader
+can observe the key go back in time.
+
+**Verification.**
+
+| Check | Result |
+|---|---|
+| 1,000 simultaneous connections, each doing a PUT and a GET | all correct; server reports exactly 1,000 open, then 0 |
+| File descriptors after all clients disconnect and the server stops | equal to the count before it started |
+| A frame with an invalid type | that connection is closed; others are unaffected |
+| A handler that holds its responder | 50 requests on another connection complete meanwhile |
+| libFuzzer on the frame + request/response parsers | see below |
+| libFuzzer on WAL replay and SSTable parsing | millions of inputs, no crash |
+
 ## Bug log
 
 | # | Milestone | Symptom | Cause | Caught by |
 |---|---|---|---|---|
 | 1 | M1 | UBSan: `null pointer passed as argument 2` in `MemTable::Add` | A delete's empty value is a `string_view` with a null `data()`, and `memcpy(dst, nullptr, 0)` is undefined behavior even for zero bytes | UBSan in the ASan build |
 | 2 | M1 | ASan `stack-use-after-scope` and a TSan race in the concurrent-reader test | The reader lambda captured the loop index by reference; it was read after the loop moved on | ASan and TSan, same run |
+| 3 | M3 | Frame fuzzer died with `SIGTRAP` after ~800 inputs | Not a decoder bug: the fuzz target asserted that a decoded request re-encodes to identical bytes, but varints have non-minimal encodings (`80 00` is also 0). The real invariant is decode, encode, decode gives the same fields | libFuzzer |
