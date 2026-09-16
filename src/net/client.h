@@ -25,6 +25,8 @@ class Connection {
   Connection& operator=(const Connection&) = delete;
 
   Status Send(const Frame& frame, Millis timeout);
+  // SendBytes writes pre-encoded frames, letting a caller batch many into one write.
+  Status SendBytes(std::string_view bytes, Millis timeout);
   // Receive returns the next frame, whatever its request id.
   Status Receive(Frame* frame, Millis timeout);
   // Call sends a request with a fresh id and waits for the response carrying that id,

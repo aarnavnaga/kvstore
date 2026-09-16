@@ -84,7 +84,10 @@ Status Connection::Dial(const std::string& addr, Millis timeout, std::unique_ptr
 Connection::~Connection() { ::close(fd_); }
 
 Status Connection::Send(const Frame& frame, Millis timeout) {
-  const std::string bytes = EncodeFrame(frame);
+  return SendBytes(EncodeFrame(frame), timeout);
+}
+
+Status Connection::SendBytes(std::string_view bytes, Millis timeout) {
   const auto deadline = Clock::now() + timeout;
   size_t sent = 0;
   while (sent < bytes.size()) {
