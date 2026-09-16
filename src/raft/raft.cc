@@ -427,12 +427,26 @@ bool RaftNode::CheckQuorumActive() {
 }
 
 Status RaftNode::Propose(std::string data, Index* index, Term* term) {
+  std::vector<std::string> one;
+  one.push_back(std::move(data));
+  return ProposeBatch(std::move(one), index, term);
+}
+
+Status RaftNode::ProposeBatch(std::vector<std::string> data, Index* first, Term* term) {
   if (role_ != Role::kLeader) {
     return Status::NotLeader();
   }
+  if (data.empty()) {
+    return Status::InvalidArgument("empty proposal batch");
+  }
   const Index next = storage_->LastIndex() + 1;
-  AppendToLog({Entry{term_, next, EntryType::kNormal, std::move(data)}});
-  *index = next;
+  std::vector<Entry> entries;
+  entries.reserve(data.size());
+  for (auto& d : data) {
+    entries.push_back(Entry{term_, next + entries.size(), EntryType::kNormal, std::move(d)});
+  }
+  AppendToLog(entries);
+  *first = next;
   *term = term_;
   MaybeAdvanceCommit();
   BroadcastAppend();

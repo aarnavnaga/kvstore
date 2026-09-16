@@ -20,6 +20,14 @@ add_library(kv_storage
 )
 target_link_libraries(kv_storage PUBLIC kv_common)
 
+add_library(kv_raft
+  raft/file_storage.cc
+  raft/memory_storage.cc
+  raft/message.cc
+  raft/raft.cc
+)
+target_link_libraries(kv_raft PUBLIC kv_common kv_storage)
+
 add_library(kv_net
   net/client.cc
   net/frame.cc
@@ -31,18 +39,16 @@ target_link_libraries(kv_net PUBLIC kv_common)
 add_library(kv_client client/kv_client.cc)
 target_link_libraries(kv_client PUBLIC kv_net)
 
-add_library(kv_server_lib server/standalone_service.cc)
-target_link_libraries(kv_server_lib PUBLIC kv_net kv_storage)
+add_library(kv_server_lib
+  server/kv_state_machine.cc
+  server/peer_transport.cc
+  server/replica.cc
+  server/standalone_service.cc
+)
+target_link_libraries(kv_server_lib PUBLIC kv_net kv_storage kv_raft)
 
 add_executable(kvserver server/main.cc)
 target_link_libraries(kvserver PRIVATE kv_server_lib)
 
 add_executable(kvcli tools/kvcli.cc)
 target_link_libraries(kvcli PRIVATE kv_client)
-
-add_library(kv_raft
-  raft/memory_storage.cc
-  raft/message.cc
-  raft/raft.cc
-)
-target_link_libraries(kv_raft PUBLIC kv_common)
