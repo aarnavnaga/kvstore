@@ -19,3 +19,23 @@ add_library(kv_storage
   storage/write_batch.cc
 )
 target_link_libraries(kv_storage PUBLIC kv_common)
+
+add_library(kv_net
+  net/client.cc
+  net/frame.cc
+  net/protocol.cc
+  net/server.cc
+)
+target_link_libraries(kv_net PUBLIC kv_common)
+
+add_library(kv_client client/kv_client.cc)
+target_link_libraries(kv_client PUBLIC kv_net)
+
+add_library(kv_server_lib server/standalone_service.cc)
+target_link_libraries(kv_server_lib PUBLIC kv_net kv_storage)
+
+add_executable(kvserver server/main.cc)
+target_link_libraries(kvserver PRIVATE kv_server_lib)
+
+add_executable(kvcli tools/kvcli.cc)
+target_link_libraries(kvcli PRIVATE kv_client)

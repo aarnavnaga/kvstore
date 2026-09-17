@@ -60,3 +60,26 @@ jobs:
         run: |
           CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja -DKV_BUILD_TESTS=OFF
           find src -name '*.cc' -print0 | xargs -0 -r clang-tidy-18 -p build --quiet
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    env:
+      CC: clang-18
+      CXX: clang++-18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 libclang-rt-18-dev llvm-18 \
+            ninja-build libssl-dev zlib1g-dev
+      - name: Build fuzzers
+        run: |
+          cmake -S . -B build -G Ninja -DKV_BUILD_FUZZ=ON -DKV_BUILD_TESTS=OFF
+          cmake --build build -j"$(nproc)"
+      - name: Fuzz each parser for 60 seconds
+        run: |
+          for f in frame wal sstable; do
+            mkdir -p corpus-$f
+            ./build/fuzz/${f}_fuzzer -max_total_time=60 -print_final_stats=1 corpus-$f
+          done
