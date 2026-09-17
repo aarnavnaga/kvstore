@@ -254,6 +254,81 @@ simulator was checked against deliberately broken Raft:
 | Nodes may vote twice in one term | randomized runs, in 4 ms |
 | The vote is kept in memory but not persisted | the unit test at once; the randomized runs only after adding fast crash-restart churn (bug log #4) |
 
+## Replication into the LSM tree (M5)
+
+```
+client ─► any node ─(NotLeader + hint)─► leader
+                                          │ Raft thread: batch proposals, one fsync
+                                          ▼
+                                 raft.log (FileLogStorage) ──AppendEntries──► followers
+                                          │ committed
+                                          ▼
+                                 KvStateMachine.Apply ─► one atomic WriteBatch into the LSM
+                                          │
+                                          ▼
+                                 responder for that log index ─► client
+```
+
+**One thread owns Raft.** Network threads never touch the consensus state. They decode
+frames and push events (peer messages, client commands) onto an inbox; the Raft thread
+drains it, steps Raft, ticks every 10 ms, proposes all queued client writes as one batch,
+sends outgoing messages, applies committed entries and answers the clients waiting on
+them. No locks inside the consensus logic, and the code path is the one the simulator
+tested.
+
+**Batching is where the throughput comes from.** All client writes that arrive while
+the Raft thread is busy become one `ProposeBatch`: one log append, one `fdatasync`, one
+`AppendEntries` per follower. This is group commit again, one layer up.
+
+**The durable Raft log** (`FileLogStorage`) is an append-only file of CRC-framed records
+(the WAL framing from M1), plus `HARDSTATE` (term and vote) and `SNAPSHOT` metadata
+files replaced atomically. Live entries are also cached in memory, since snapshots bound
+the log. Truncating a conflicting suffix rewrites the file atomically *before* the new
+entries are appended, so a crash can never leave stale entries followed by new ones.
+
+**The state machine stores its applied index in the same write batch as the data.**
+Each apply call is one `WriteBatch` holding the data, the client session updates and
+`(applied index, term, running hash)`. After a crash the store's contents and its idea of
+how far it got cannot disagree, so recovery is: read the applied index, tell Raft, and
+let it hand over everything after. The DB itself runs with `sync=false`, because the Raft
+log is already durable: anything an unsynced WAL loses in a power failure is re-applied
+from the log. That saves a second `fsync` per write. The one rule this creates: the DB
+must be flushed before the Raft log is ever compacted past what it has applied (M6).
+
+**Exactly-once writes.** The session table (`client id -> last applied seq`) lives in the
+LSM under a reserved key prefix, inside the same atomic batches, so it survives crashes
+and is identical on every replica. A retried write whose `seq` was already applied is
+acknowledged without being applied again; a unit test shows a retry arriving after
+another client's overwrite does not resurrect the old value.
+
+**What a client is told.** A response means the command committed and was applied. If a
+proposal's log index ends up holding a different term's entry, it never committed there
+and the client is told to retry (safe, thanks to sessions). If it is still pending after 5
+seconds the answer is `Timeout`: the outcome is genuinely unknown, and saying so is what
+lets M7's checker treat it correctly.
+
+**Reads, for now, go through the log.** A GET is proposed like a write and answered when
+it is applied, which is linearizable but costs a log append and an `fsync`. M6 replaces
+it with ReadIndex.
+
+**Verification.**
+
+| Test | Result |
+|---|---|
+| Simulator: 500 randomized runs with a write stream, crashes, partitions, loss | 43,862 entries applied identically on every node, 0 violations |
+| Simulator: every minority subset of a 3- and 5-node cluster lost, leader included | every write before and during the loss present on every node afterwards |
+| Real cluster: leader stopped under 4 concurrent writers, then restarted | 1,737 acknowledged writes all readable; nodes converge to the same applied hash |
+| Real cluster: 2 of 5 nodes down (one the leader) | writes keep succeeding; the two catch up when restarted |
+| Real cluster: every node stopped and restarted | all data readable |
+
+**Mutation testing, round two.** Three classic Raft bugs, introduced one at a time:
+
+| Mutation | Caught by |
+|---|---|
+| Vote without checking the candidate's log is up to date | randomized runs: "index 57 applied as term 1 elsewhere but term 10" |
+| Follower sets commit to the leader's commit, not `min(leader commit, last new entry)` | only after two test changes (bug log #7): "node 2 committed through index 2 but its log ends at 1" |
+| Leader commits an earlier term's entry by counting replicas (the paper's Figure 8) | only after harsher fault schedules (bug log #7): "index 29 applied as term 8 elsewhere but term 12 on node 1" |
+
 ## Bug log
 
 | # | Milestone | Symptom | Cause | Caught by |
@@ -264,3 +339,4 @@ simulator was checked against deliberately broken Raft:
 | 4 | M4 | The randomized simulator passed with vote persistence deliberately removed | Faults were only injected every 50 to 200 ticks; a forgotten vote only elects two leaders if a node votes, crashes, restarts and votes again *within one election*. Added per-tick crash-restart churn; the mutation then fails at seed 5, tick 1425: "nodes 1 and 2 both leader in term 8" | Mutation testing |
 | 5 | M4 | ASan heap-use-after-free in a Raft unit test; release builds passed | The test kept a pointer into the vector returned by `TakeMessages()`, a temporary destroyed at the end of the statement | ASan and TSan |
 | 6 | M4 | CI lint failed on code that "passed" lint locally | Local clang-tidy colorizes output, so `grep ' error: '` matched nothing and the local gate passed silently since M2. Lint now runs with `--use-color=false` and is judged by exit code | CI |
+| 7 | M5 | Two deliberately injected Raft bugs passed 500 randomized runs | Every append carried the follower's whole missing log (tiny commands, 1 MB batches), so "commit past what the leader vouched for" never had a partial append to bite; and leaders rarely died with entries half-replicated, which Figure 8 needs. Half the runs now send one entry per message, leaders are killed on purpose, churn is 3x higher, and the simulator checks that commit never passes the end of a node's log | Mutation testing |
