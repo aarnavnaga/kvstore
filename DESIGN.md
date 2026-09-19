@@ -191,7 +191,7 @@ can observe the key go back in time.
 | File descriptors after all clients disconnect and the server stops | equal to the count before it started |
 | A frame with an invalid type | that connection is closed; others are unaffected |
 | A handler that holds its responder | 50 requests on another connection complete meanwhile |
-| libFuzzer on the frame + request/response parsers | see below |
+| libFuzzer on the frame + request/response parsers, 1 hour | 112.8M inputs in 3,601 s, no crash, no leak, peak RSS 550 MB |
 | libFuzzer on WAL replay and SSTable parsing | millions of inputs, no crash |
 
 ## Raft: the core and the simulator (M4)
