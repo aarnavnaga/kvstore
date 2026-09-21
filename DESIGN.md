@@ -191,8 +191,68 @@ can observe the key go back in time.
 | File descriptors after all clients disconnect and the server stops | equal to the count before it started |
 | A frame with an invalid type | that connection is closed; others are unaffected |
 | A handler that holds its responder | 50 requests on another connection complete meanwhile |
-| libFuzzer on the frame + request/response parsers | see below |
+| libFuzzer on the frame + request/response parsers, 1 hour | 112.8M inputs in 3,601 s, no crash, no leak, peak RSS 550 MB |
 | libFuzzer on WAL replay and SSTable parsing | millions of inputs, no crash |
+
+## Raft: the core and the simulator (M4)
+
+**Raft as a deterministic state machine.** `RaftNode` (`src/raft/raft.cc`) owns no
+threads, clock or sockets. Its owner calls `Tick()` on a fixed interval, feeds peer
+messages to `Step()`, and drains `TakeMessages()` and `TakeCommittedEntries()`. Time is
+a tick count and randomness comes from a seeded generator. Two things follow:
+
+- The same code runs in production and in a single-process simulator, so what the
+  simulator verifies is the code that ships, not a model of it.
+- A failing run replays exactly from its seed, which turns a one-in-a-million
+  interleaving into an ordinary failing unit test.
+
+**Persist before you speak.** Every change to the term, the vote or the log goes through
+`LogStorage` synchronously, *before* any message that depends on it is queued. A node
+that grants a vote, crashes and restarts still remembers it, so it cannot vote for a
+second candidate in the same term (which could elect two leaders). If storage fails, the
+node aborts: continuing after a failed `fsync` would mean answering peers with state it
+may have lost, and fail-stop is the only behavior Raft's proofs cover.
+
+**Elections.** Followers wait a timeout drawn uniformly from 10 to 20 ticks; drawing a
+fresh one after every reset makes two nodes timing out together, and splitting the vote
+forever, vanishingly unlikely. A node only votes for a candidate whose log is at least
+as up to date as its own (last term, then length), which guarantees a new leader holds
+every committed entry. A new leader appends a no-op entry in its term: a leader may only
+commit entries from its own term by counting replicas (the paper's Figure 8), and the
+no-op lets everything before it commit promptly.
+
+**PreVote and CheckQuorum.** Plain Raft has a well-known failure mode: a node cut off by
+a partition keeps timing out and incrementing its term, and when the partition heals its
+inflated term forces the healthy leader to step down, causing an outage for no reason.
+
+- *PreVote:* a node first asks "would you vote for me in term T+1?" and only bumps its
+  term if a majority says yes. A partitioned node never gets that majority, so its term
+  stays put (`RaftElection.PreVoteDoesNotChangeTerm`: 1,000 ticks alone, term still 0).
+- *CheckQuorum:* a leader that has not heard from a majority within an election timeout
+  steps down. A leader stranded on the minority side of a partition stops acting as
+  one, and followers that heard from a live leader recently ignore vote requests.
+
+Both matter for M7's "flapping partition" and "leader on the minority side" scenarios.
+
+**The simulator** (`tests/raft_sim.h`) runs 3 or 5 nodes on a logical clock, with a
+network that delays (1 to 10 ticks), drops (up to 40%), duplicates (up to 20%) and
+reorders messages and can be partitioned arbitrarily, all from one seed. It checks
+election safety (one leader per term, ever) after every delivered message, plus
+state-machine safety and in-order apply, which M5 starts exercising.
+
+| Test | Result |
+|---|---|
+| 1,000 randomized runs: crashes, fast crash-restart churn, partitions, loss, duplication, delay | 9,211 terms elected a leader, 0 safety violations, a stable leader after every heal |
+| Kill the leader of a 5-node cluster, 50 seeds | a new leader with a higher term every time; the old one rejoins as a follower |
+| Isolate a follower for 2,000 ticks, then heal | same leader, same term (PreVote) |
+
+**Testing the tests.** A safety test that has never failed proves little, so the
+simulator was checked against deliberately broken Raft:
+
+| Mutation | Caught by |
+|---|---|
+| Nodes may vote twice in one term | randomized runs, in 4 ms |
+| The vote is kept in memory but not persisted | the unit test at once; the randomized runs only after adding fast crash-restart churn (bug log #4) |
 
 ## Bug log
 
@@ -201,3 +261,6 @@ can observe the key go back in time.
 | 1 | M1 | UBSan: `null pointer passed as argument 2` in `MemTable::Add` | A delete's empty value is a `string_view` with a null `data()`, and `memcpy(dst, nullptr, 0)` is undefined behavior even for zero bytes | UBSan in the ASan build |
 | 2 | M1 | ASan `stack-use-after-scope` and a TSan race in the concurrent-reader test | The reader lambda captured the loop index by reference; it was read after the loop moved on | ASan and TSan, same run |
 | 3 | M3 | Frame fuzzer died with `SIGTRAP` after ~800 inputs | Not a decoder bug: the fuzz target asserted that a decoded request re-encodes to identical bytes, but varints have non-minimal encodings (`80 00` is also 0). The real invariant is decode, encode, decode gives the same fields | libFuzzer |
+| 4 | M4 | The randomized simulator passed with vote persistence deliberately removed | Faults were only injected every 50 to 200 ticks; a forgotten vote only elects two leaders if a node votes, crashes, restarts and votes again *within one election*. Added per-tick crash-restart churn; the mutation then fails at seed 5, tick 1425: "nodes 1 and 2 both leader in term 8" | Mutation testing |
+| 5 | M4 | ASan heap-use-after-free in a Raft unit test; release builds passed | The test kept a pointer into the vector returned by `TakeMessages()`, a temporary destroyed at the end of the statement | ASan and TSan |
+| 6 | M4 | CI lint failed on code that "passed" lint locally | Local clang-tidy colorizes output, so `grep ' error: '` matched nothing and the local gate passed silently since M2. Lint now runs with `--use-color=false` and is judged by exit code | CI |
