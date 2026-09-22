@@ -29,6 +29,10 @@ RaftNode::RaftNode(Config config, LogStorage* storage)
   // it already applied. Commit is not persisted: a node relearns it from the leader.
   applied_ = std::max(config_.applied, storage_->Snapshot().index);
   commit_ = applied_;
+  joined_ = !(config_.join || hs.joining);
+  if (!joined_ && !hs.joining) {
+    SetTerm(term_, vote_);  // persists joining=true before anything else happens
+  }
   ResetElectionTimer();
 }
 
@@ -48,6 +52,10 @@ void RaftNode::BecomeFollower(Term term, NodeId leader) {
   leader_ = leader;
   votes_.clear();
   progress_.clear();
+  // Reads in flight lose their leadership confirmation; the owner sees the role change
+  // and fails them (they are safe to retry).
+  queued_reads_.clear();
+  pending_reads_.clear();
   ResetElectionTimer();
 }
 
@@ -85,6 +93,7 @@ void RaftNode::BecomeLeader() {
   // the paper). Appending a no-op lets it commit everything before it promptly, which is
   // also what makes ReadIndex safe.
   AppendToLog({Entry{term_, last + 1, EntryType::kNoop, {}}});
+  term_start_index_ = last + 1;
   MaybeAdvanceCommit();  // a single-node cluster commits on its own
   BroadcastAppend();
 }
@@ -94,6 +103,11 @@ void RaftNode::BecomeLeader() {
 
 void RaftNode::Tick() {
   if (role_ == Role::kLeader) {
+    for (auto& [peer, pr] : progress_) {
+      if (pr.snapshot) {
+        ++pr.snapshot_idle_ticks;
+      }
+    }
     ++heartbeat_elapsed_;
     ++election_elapsed_;
     if (config_.check_quorum && election_elapsed_ >= config_.election_ticks_min) {
@@ -112,6 +126,10 @@ void RaftNode::Tick() {
     return;
   }
   if (++election_elapsed_ >= randomized_election_ticks_) {
+    if (!joined_) {
+      ResetElectionTimer();  // a joining node never campaigns; it waits for a leader
+      return;
+    }
     StartElection(config_.pre_vote);
   }
 }
@@ -213,8 +231,11 @@ void RaftNode::Step(const Message& m) {
       HandleAppendResponse(m);
       break;
     case MsgKind::kSnapshotRequest:
+      HandleSnapshotRequest(m);
+      break;
     case MsgKind::kSnapshotResponse:
-      break;  // M6
+      HandleSnapshotResponse(m);
+      break;
   }
 }
 
@@ -234,7 +255,7 @@ void RaftNode::HandleVoteRequest(const Message& m) {
   const bool can_vote = vote_ == m.from ||                           // repeat of our vote
                         (vote_ == kNoNode && leader_ == kNoNode) ||  // free to vote
                         (m.pre_vote && m.term > term_);              // PreVote for a future term
-  const bool grant = can_vote && LogUpToDate(m.last_log_index, m.last_log_term);
+  const bool grant = joined_ && can_vote && LogUpToDate(m.last_log_index, m.last_log_term);
 
   if (grant && !m.pre_vote) {
     // The vote is durable before the response is queued: a node that votes, crashes and
@@ -343,9 +364,20 @@ void RaftNode::HandleAppendRequest(const Message& m) {
   if (m.commit > commit_) {
     commit_ = std::min(m.commit, last_new);
   }
+  MaybeJoin();
   r.success = true;
   r.match_index = last_new;
   Send(std::move(r));
+}
+
+void RaftNode::MaybeJoin() {
+  // Committing an entry of the current leader's term means our log now contains every
+  // entry committed before it (Log Matching), including any we forgot when wiped.
+  if (!joined_ && leader_ != kNoNode && commit_ > 0 && commit_ <= storage_->LastIndex() &&
+      storage_->TermAt(commit_) == term_) {
+    joined_ = true;
+    SetTerm(term_, vote_);  // clear the durable joining flag
+  }
 }
 
 void RaftNode::HandleAppendResponse(const Message& m) {
@@ -358,6 +390,21 @@ void RaftNode::HandleAppendResponse(const Message& m) {
   }
   Progress& pr = it->second;
   pr.recent_active = true;
+
+  // Any response in our term, success or not, confirms we were still leader when the
+  // heartbeat carrying read_ctx went out, which covers every read up to that ctx.
+  if (m.read_ctx != 0 && !pending_reads_.empty()) {
+    for (PendingRead& r : pending_reads_) {
+      if (r.ctx <= m.read_ctx) {
+        r.acks.insert(m.from);
+      }
+    }
+    while (!pending_reads_.empty() && pending_reads_.front().acks.size() >= Quorum()) {
+      ready_reads_.push_back({pending_reads_.front().ctx, pending_reads_.front().index});
+      pending_reads_.pop_front();
+    }
+  }
+
   if (m.success) {
     if (m.match_index > pr.match) {
       pr.match = m.match_index;
@@ -369,8 +416,15 @@ void RaftNode::HandleAppendResponse(const Message& m) {
     }
     return;
   }
-  // Rejected: back up to the follower's hint, but never below what it already matched.
-  pr.next = std::max(pr.match + 1, std::min(m.reject_hint, pr.next));
+  // Rejected: back up to the follower's hint. Normally the hint is above what the
+  // follower already matched, but a follower whose disk was wiped has lost entries it
+  // once acknowledged. Lowering match is always safe (it only makes commit counting
+  // more conservative, and commit never moves backwards); clamping next to the old match
+  // instead would resend the same rejected append forever.
+  pr.next = std::max<Index>(1, std::min(m.reject_hint, pr.next));
+  if (pr.next <= pr.match) {
+    pr.match = pr.next - 1;
+  }
   SendAppend(m.from);
 }
 
@@ -383,12 +437,25 @@ void RaftNode::BroadcastAppend() {
 void RaftNode::SendAppend(NodeId to) {
   Progress& pr = progress_[to];
   const Index prev = pr.next - 1;
+  if (pr.snapshot) {
+    // A transfer is in flight: retransmit its chunk only if it has gone unanswered.
+    if (pr.snapshot_idle_ticks >= config_.election_ticks_min / 2) {
+      SendSnapshot(to);
+    }
+    return;
+  }
+  if (prev < storage_->Snapshot().index) {
+    // The entries this follower needs were compacted away: send the snapshot instead.
+    SendSnapshot(to);
+    return;
+  }
   Message m;
   m.kind = MsgKind::kAppendRequest;
   m.to = to;
   m.prev_log_index = prev;
   m.prev_log_term = storage_->TermAt(prev);
   m.commit = commit_;
+  m.read_ctx = pending_reads_.empty() ? 0 : latest_read_ctx_;
   storage_->GetEntries(pr.next, storage_->LastIndex() + 1, config_.max_append_bytes, &m.entries);
   if (!m.entries.empty()) {
     // Pipeline: assume delivery and keep streaming. A loss shows up as a rejection,
@@ -413,6 +480,195 @@ void RaftNode::MaybeAdvanceCommit() {
   if (candidate > commit_ && storage_->TermAt(candidate) == term_) {
     commit_ = candidate;
   }
+  if (!queued_reads_.empty() && commit_ >= term_start_index_) {
+    StartPendingReads();
+  }
+}
+
+// ---------------------------------------------------------------------------------------
+// ReadIndex
+
+Status RaftNode::ReadIndex(uint64_t ctx) {
+  if (role_ != Role::kLeader) {
+    return Status::NotLeader();
+  }
+  queued_reads_.push_back(ctx);
+  // Until this term's no-op commits, our commit index may lag entries a previous leader
+  // committed; a read index taken now could miss them.
+  if (commit_ >= term_start_index_) {
+    StartPendingReads();
+  }
+  return Status::OK();
+}
+
+void RaftNode::StartPendingReads() {
+  for (const uint64_t ctx : queued_reads_) {
+    if (Quorum() == 1) {
+      ready_reads_.push_back({ctx, commit_});
+      continue;
+    }
+    pending_reads_.push_back(PendingRead{ctx, commit_, {config_.id}});
+    latest_read_ctx_ = std::max(latest_read_ctx_, ctx);
+  }
+  queued_reads_.clear();
+  if (!pending_reads_.empty()) {
+    BroadcastAppend();  // the heartbeat round that confirms leadership
+  }
+}
+
+std::vector<RaftNode::ReadState> RaftNode::TakeReadStates() {
+  std::vector<ReadState> out;
+  out.swap(ready_reads_);
+  return out;
+}
+
+// ---------------------------------------------------------------------------------------
+// Snapshots
+
+Status RaftNode::Compact(Index index) {
+  if (index > applied_) {
+    return Status::InvalidArgument("cannot compact past the applied index");
+  }
+  if (index <= storage_->Snapshot().index) {
+    return Status::OK();
+  }
+  return storage_->Compact(SnapshotMeta{index, storage_->TermAt(index)});
+}
+
+void RaftNode::SendSnapshot(NodeId to) {
+  Progress& pr = progress_[to];
+  if (!pr.snapshot) {
+    if (!config_.snapshot_source) {
+      return;
+    }
+    pr.snapshot = config_.snapshot_source();
+    pr.snapshot_offset = 0;
+    if (!pr.snapshot) {
+      return;
+    }
+  }
+  pr.snapshot_idle_ticks = 0;
+  const std::string& data = pr.snapshot->data;
+  const uint64_t offset = std::min<uint64_t>(pr.snapshot_offset, data.size());
+  const size_t len = std::min<size_t>(config_.snapshot_chunk_bytes, data.size() - offset);
+  Message m;
+  m.kind = MsgKind::kSnapshotRequest;
+  m.to = to;
+  m.snapshot = pr.snapshot->meta;
+  m.offset = offset;
+  m.data = data.substr(offset, len);
+  m.done = offset + len == data.size();
+  m.commit = commit_;
+  Send(std::move(m));
+}
+
+void RaftNode::HandleSnapshotRequest(const Message& m) {
+  if (role_ != Role::kFollower) {
+    BecomeFollower(term_, m.from);
+  }
+  leader_ = m.from;
+  election_elapsed_ = 0;
+
+  Message r;
+  r.kind = MsgKind::kSnapshotResponse;
+  r.to = m.from;
+  r.snapshot = m.snapshot;
+
+  if (m.snapshot.index <= commit_) {
+    // We already have everything it covers; just tell the leader where we are.
+    incoming_snapshot_.reset();
+    r.success = true;
+    r.done = true;
+    r.match_index = commit_;
+    Send(std::move(r));
+    return;
+  }
+  if (m.offset == 0) {
+    incoming_snapshot_ = Snapshot{m.snapshot, {}};
+  } else if (!incoming_snapshot_ || incoming_snapshot_->meta.index != m.snapshot.index ||
+             incoming_snapshot_->meta.term != m.snapshot.term ||
+             incoming_snapshot_->data.size() != m.offset) {
+    // A chunk out of sequence (lost or reordered): ask for the byte we expect next.
+    const bool same = incoming_snapshot_ && incoming_snapshot_->meta.index == m.snapshot.index &&
+                      incoming_snapshot_->meta.term == m.snapshot.term;
+    r.success = false;
+    r.offset = same ? incoming_snapshot_->data.size() : 0;
+    Send(std::move(r));
+    return;
+  }
+  incoming_snapshot_->data.append(m.data);
+  if (!m.done) {
+    r.success = true;
+    r.offset = incoming_snapshot_->data.size();
+    Send(std::move(r));
+    return;
+  }
+
+  // Complete. The state machine takes it first (durably); only then does the log forget
+  // what the snapshot replaces.
+  const Snapshot snap = std::move(*incoming_snapshot_);
+  incoming_snapshot_.reset();
+  if (!config_.snapshot_sink) {
+    Fatal(Status::InvalidArgument("received a snapshot but no snapshot_sink is configured"));
+  }
+  Status s = config_.snapshot_sink(snap);
+  if (!s.ok()) {
+    Fatal(s);
+  }
+  if (storage_->LastIndex() >= snap.meta.index &&
+      storage_->TermAt(snap.meta.index) == snap.meta.term) {
+    s = storage_->Compact(snap.meta);  // our log continues the snapshot: keep the suffix
+  } else {
+    s = storage_->ResetToSnapshot(snap.meta);
+  }
+  if (!s.ok()) {
+    Fatal(s);
+  }
+  commit_ = std::max(commit_, snap.meta.index);
+  applied_ = snap.meta.index;
+  ++snapshots_installed_;
+  MaybeJoin();
+  r.success = true;
+  r.done = true;
+  r.match_index = snap.meta.index;
+  Send(std::move(r));
+}
+
+void RaftNode::HandleSnapshotResponse(const Message& m) {
+  if (role_ != Role::kLeader) {
+    return;
+  }
+  const auto it = progress_.find(m.from);
+  if (it == progress_.end()) {
+    return;
+  }
+  Progress& pr = it->second;
+  pr.recent_active = true;
+  if (m.success && m.done) {
+    if (pr.snapshot && pr.snapshot->meta.index == m.snapshot.index) {
+      pr.snapshot.reset();
+      ++snapshots_sent_;
+    }
+    if (m.match_index > pr.match) {
+      pr.match = m.match_index;
+      MaybeAdvanceCommit();
+    }
+    pr.next = std::max(pr.next, pr.match + 1);
+    SendAppend(m.from);
+    return;
+  }
+  if (!pr.snapshot || pr.snapshot->meta.index != m.snapshot.index ||
+      pr.snapshot->meta.term != m.snapshot.term) {
+    return;  // a response to a transfer we have since abandoned
+  }
+  if (m.success && m.offset <= pr.snapshot_offset) {
+    return;  // duplicate or stale ack for a chunk already acknowledged
+  }
+  if (!m.success && m.offset == pr.snapshot_offset) {
+    return;  // the follower wants the chunk we are already waiting on
+  }
+  pr.snapshot_offset = m.offset;  // next chunk on success, the expected one on a reject
+  SendSnapshot(m.from);
 }
 
 bool RaftNode::CheckQuorumActive() {
@@ -467,6 +723,21 @@ std::vector<Entry> RaftNode::TakeCommittedEntries() {
 // ---------------------------------------------------------------------------------------
 // Helpers
 
+std::string RaftNode::DebugString() const {
+  std::string out;
+  for (const auto& [peer, pr] : progress_) {
+    out += " [" + std::to_string(peer) + ": next=" + std::to_string(pr.next) +
+           " match=" + std::to_string(pr.match);
+    if (pr.snapshot) {
+      out += " snap=" + std::to_string(pr.snapshot->meta.index) + "@" +
+             std::to_string(pr.snapshot_offset) + "/" + std::to_string(pr.snapshot->data.size()) +
+             " idle=" + std::to_string(pr.snapshot_idle_ticks);
+    }
+    out += "]";
+  }
+  return out;
+}
+
 void RaftNode::Send(Message m) {
   m.from = config_.id;
   if (m.term == 0) {
@@ -482,7 +753,7 @@ std::vector<Message> RaftNode::TakeMessages() {
 }
 
 void RaftNode::SetTerm(Term term, NodeId vote) {
-  const Status s = storage_->SaveHardState(HardState{term, vote});
+  const Status s = storage_->SaveHardState(HardState{term, vote, !joined_});
   if (!s.ok()) {
     Fatal(s);
   }

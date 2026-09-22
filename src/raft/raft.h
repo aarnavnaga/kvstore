@@ -1,7 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <map>
+#include <memory>
+#include <optional>
 #include <random>
 #include <set>
 #include <string>
@@ -37,6 +41,21 @@ struct Config {
   // The state machine's last applied index, from its own durable state. Entries up to
   // here are never handed out again for applying.
   Index applied = 0;
+
+  // snapshot_source returns the state machine's current snapshot, to send to a follower
+  // that needs entries the log no longer has. snapshot_sink durably replaces the state
+  // machine with a snapshot received from the leader; it runs before the log is reset,
+  // so a crash in between leaves a state machine that is ahead of the log, never behind.
+  std::function<std::shared_ptr<const Snapshot>()> snapshot_source;
+  std::function<Status(const Snapshot&)> snapshot_sink;
+  size_t snapshot_chunk_bytes = 1 << 20;
+
+  // join marks a node whose storage was wiped. It has forgotten its votes and possibly
+  // entries it acknowledged, so voting could elect a second leader in a term or a leader
+  // missing committed entries. It stays a silent follower until it has committed an
+  // entry from the current leader's term: from then on its log holds every committed
+  // entry (Log Matching), and it votes normally.
+  bool join = false;
 };
 
 enum class Role { kFollower, kPreCandidate, kCandidate, kLeader };
@@ -78,6 +97,21 @@ class RaftNode {
   // TakeCommittedEntries returns committed entries not yet handed out, in log order.
   std::vector<Entry> TakeCommittedEntries();
 
+  // Compact discards log entries up to index, which the state machine has applied and
+  // made durable. index must be <= applied_index().
+  Status Compact(Index index);
+
+  // ReadIndex starts a linearizable read tagged ctx (section 6.4 of the Raft thesis): the
+  // leader records its commit index, confirms with a heartbeat round that it is still
+  // leader, and then reports the read ready. The owner serves it once the state machine
+  // has applied through that index. ctx values must increase. NotLeader on a follower.
+  Status ReadIndex(uint64_t ctx);
+  struct ReadState {
+    uint64_t ctx;
+    Index index;
+  };
+  std::vector<ReadState> TakeReadStates();
+
   [[nodiscard]] NodeId id() const { return config_.id; }
   [[nodiscard]] Role role() const { return role_; }
   [[nodiscard]] Term term() const { return term_; }
@@ -85,12 +119,30 @@ class RaftNode {
   [[nodiscard]] Index commit_index() const { return commit_; }
   [[nodiscard]] Index last_index() const { return storage_->LastIndex(); }
   [[nodiscard]] Index applied_index() const { return applied_; }
+  [[nodiscard]] bool joined() const { return joined_; }
+  [[nodiscard]] uint64_t snapshots_installed() const { return snapshots_installed_; }
+  [[nodiscard]] uint64_t snapshots_sent() const { return snapshots_sent_; }
+  // DebugString describes the leader's view of each follower, for test failures.
+  [[nodiscard]] std::string DebugString() const;
 
  private:
   struct Progress {
     Index next = 1;   // next entry to send
     Index match = 0;  // highest entry known to be replicated
     bool recent_active = false;
+    // Snapshot transfer in progress: the blob and the byte offset of the chunk awaiting
+    // acknowledgement. Strictly stop-and-wait: only an ack that advances the offset
+    // sends the next chunk, and a chunk is retransmitted only after it has gone
+    // unanswered for a while. (Resending on every heartbeat instead starts a new chain
+    // of chunks per heartbeat, and the chains multiply; bug log #9.)
+    std::shared_ptr<const Snapshot> snapshot;
+    uint64_t snapshot_offset = 0;
+    int snapshot_idle_ticks = 0;
+  };
+  struct PendingRead {
+    uint64_t ctx;
+    Index index;
+    std::set<NodeId> acks;
   };
 
   void BecomeFollower(Term term, NodeId leader);
@@ -103,6 +155,11 @@ class RaftNode {
   void HandleVoteResponse(const Message& m);
   void HandleAppendRequest(const Message& m);
   void HandleAppendResponse(const Message& m);
+  void HandleSnapshotRequest(const Message& m);
+  void HandleSnapshotResponse(const Message& m);
+  void SendSnapshot(NodeId to);
+  void StartPendingReads();
+  void MaybeJoin();
 
   void BroadcastAppend();
   void SendAppend(NodeId to);
@@ -134,6 +191,17 @@ class RaftNode {
 
   std::map<NodeId, bool> votes_;  // this round's responses: granted or rejected
   std::map<NodeId, Progress> progress_;
+
+  bool joined_ = true;
+  Index term_start_index_ = 0;             // index of this leader's no-op
+  std::vector<uint64_t> queued_reads_;     // waiting for this term's first commit
+  std::deque<PendingRead> pending_reads_;  // waiting for a heartbeat quorum
+  std::vector<ReadState> ready_reads_;
+  uint64_t latest_read_ctx_ = 0;
+
+  std::optional<Snapshot> incoming_snapshot_;
+  uint64_t snapshots_installed_ = 0;
+  uint64_t snapshots_sent_ = 0;
 
   std::vector<Message> outbox_;
 };
