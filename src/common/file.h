@@ -66,6 +66,8 @@ Status ReadFileToString(const std::string& path, std::string* out);
 // directory, so a crash at any point leaves either the old file or the new one.
 Status WriteFileAtomic(const std::string& path, std::string_view data);
 Status RemoveFile(const std::string& path);
+// RenamePath atomically renames a file or directory (same filesystem).
+Status RenamePath(const std::string& from, const std::string& to);
 Status RemoveDirRecursive(const std::string& dir);
 Status ListDir(const std::string& dir, std::vector<std::string>* names);
 bool FileExists(const std::string& path);

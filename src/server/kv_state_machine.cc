@@ -3,6 +3,7 @@
 #include <optional>
 
 #include "common/coding.h"
+#include "common/file.h"
 
 namespace kv::server {
 namespace {
@@ -63,9 +64,18 @@ bool DecodeCommand(std::string_view in, Command* c) {
 
 Status KvStateMachine::Open(const storage::Options& options, const std::string& dir,
                             std::unique_ptr<KvStateMachine>* out) {
+  // Finish or discard a snapshot restore that a crash interrupted (see RestoreSnapshot).
+  const std::string restore = dir + ".restore";
+  const std::string old = dir + ".old";
+  if (!FileExists(dir) && FileExists(restore)) {
+    KV_RETURN_IF_ERROR(RenamePath(restore, dir));  // crashed between the two renames
+  }
+  KV_RETURN_IF_ERROR(RemoveDirRecursive(restore));  // an incomplete restore, if any
+  KV_RETURN_IF_ERROR(RemoveDirRecursive(old));
+
   std::unique_ptr<storage::DB> db;
   KV_RETURN_IF_ERROR(storage::DB::Open(options, dir, &db));
-  std::unique_ptr<KvStateMachine> sm(new KvStateMachine(std::move(db)));
+  std::unique_ptr<KvStateMachine> sm(new KvStateMachine(std::move(db), options, dir));
   KV_RETURN_IF_ERROR(sm->LoadMeta());
   *out = std::move(sm);
   return Status::OK();
@@ -178,6 +188,72 @@ Status KvStateMachine::Apply(const std::vector<raft::Entry>& entries,
 
 Status KvStateMachine::Get(std::string_view key, std::string* value) {
   return db_->Get(key, value);
+}
+
+Status KvStateMachine::Sync() { return db_->Flush(); }
+
+namespace {
+constexpr uint32_t kSnapshotMagic = 0x504e534b;  // "KSNP"
+}  // namespace
+
+Status KvStateMachine::CreateSnapshot(raft::Snapshot* out) {
+  out->meta = {applied_, applied_term_};
+  out->data.clear();
+  PutFixed32(&out->data, kSnapshotMagic);
+  auto it = db_->NewIterator();
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    PutLengthPrefixed(&out->data, it->key());
+    PutLengthPrefixed(&out->data, it->value());
+  }
+  return it->status();
+}
+
+Status KvStateMachine::RestoreSnapshot(const raft::Snapshot& snap) {
+  std::string_view in = snap.data;
+  uint32_t magic = 0;
+  if (!GetFixed32(&in, &magic) || magic != kSnapshotMagic) {
+    return Status::Corruption("not a state machine snapshot");
+  }
+  const std::string restore = dir_ + ".restore";
+  const std::string old = dir_ + ".old";
+  KV_RETURN_IF_ERROR(RemoveDirRecursive(restore));
+  {
+    std::unique_ptr<storage::DB> fresh;
+    KV_RETURN_IF_ERROR(storage::DB::Open(options_, restore, &fresh));
+    storage::WriteBatch batch;
+    while (!in.empty()) {
+      std::string_view key;
+      std::string_view value;
+      if (!GetLengthPrefixed(&in, &key) || !GetLengthPrefixed(&in, &value)) {
+        return Status::Corruption("truncated state machine snapshot");
+      }
+      batch.Put(key, value);
+      if (batch.ByteSize() >= (1u << 20)) {
+        KV_RETURN_IF_ERROR(fresh->Write(&batch));
+        batch.Clear();
+      }
+    }
+    KV_RETURN_IF_ERROR(fresh->Write(&batch));
+    KV_RETURN_IF_ERROR(fresh->Flush());  // durable before it replaces anything
+  }
+  // Swap: old -> .old, restore -> live. Open() completes this if we crash in between.
+  db_.reset();
+  KV_RETURN_IF_ERROR(RenamePath(dir_, old));
+  KV_RETURN_IF_ERROR(RenamePath(restore, dir_));
+  const size_t slash = dir_.find_last_of('/');
+  KV_RETURN_IF_ERROR(SyncDir(slash == std::string::npos ? "." : dir_.substr(0, slash)));
+  KV_RETURN_IF_ERROR(RemoveDirRecursive(old));
+
+  KV_RETURN_IF_ERROR(storage::DB::Open(options_, dir_, &db_));
+  sessions_.clear();
+  applied_ = 0;
+  applied_term_ = 0;
+  hash_ = 0;
+  KV_RETURN_IF_ERROR(LoadMeta());
+  if (applied_ != snap.meta.index) {
+    return Status::Corruption("snapshot contents disagree with its metadata");
+  }
+  return Status::OK();
 }
 
 }  // namespace kv::server

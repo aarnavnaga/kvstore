@@ -53,6 +53,19 @@ class KvStateMachine {
   // Get reads the current state directly (used once a read is known to be linearizable).
   Status Get(std::string_view key, std::string* value);
 
+  // Sync makes everything applied so far durable (flushes the memtable). Required
+  // before the Raft log is compacted past the applied index, since the DB runs unsynced.
+  Status Sync();
+
+  // CreateSnapshot serializes the whole state, bookkeeping keys included, as of the
+  // applied index.
+  Status CreateSnapshot(raft::Snapshot* out);
+
+  // RestoreSnapshot replaces the whole state with snap. The new state is built in a
+  // side directory and swapped in with renames, so a crash leaves the old state or the
+  // new one, never a mix; Open finishes or discards an interrupted swap.
+  Status RestoreSnapshot(const raft::Snapshot& snap);
+
   [[nodiscard]] raft::Index applied_index() const { return applied_; }
   [[nodiscard]] raft::Term applied_term() const { return applied_term_; }
   // apply_hash is a running hash of every entry applied, in order. Two replicas at the
@@ -61,11 +74,14 @@ class KvStateMachine {
   storage::DB* db() { return db_.get(); }
 
  private:
-  explicit KvStateMachine(std::unique_ptr<storage::DB> db) : db_(std::move(db)) {}
+  KvStateMachine(std::unique_ptr<storage::DB> db, storage::Options options, std::string dir)
+      : db_(std::move(db)), options_(options), dir_(std::move(dir)) {}
   Status LoadMeta();
   Status SessionSeq(uint64_t client_id, uint64_t* seq);
 
   std::unique_ptr<storage::DB> db_;
+  storage::Options options_;
+  std::string dir_;
   raft::Index applied_ = 0;
   raft::Term applied_term_ = 0;
   uint64_t hash_ = 0;
