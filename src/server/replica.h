@@ -34,6 +34,19 @@ struct ReplicaOptions {
   // A client request not answered within this long gets Timeout (outcome unknown).
   std::chrono::milliseconds request_timeout{5000};
   size_t max_batch = 512;
+
+  // Snapshot and compact the Raft log once this many entries have been applied since
+  // the last snapshot, keeping snapshot_keep entries so briefly lagging followers can
+  // still catch up from the log instead of needing a full snapshot.
+  uint64_t snapshot_threshold = 10000;
+  uint64_t snapshot_keep = 1000;
+
+  // Reads use ReadIndex (no log entry, no fsync). read_through_log instead proposes
+  // every GET as a log entry; it exists only so the benchmark can compare the two.
+  bool read_through_log = false;
+
+  // join: this node's data was wiped; rejoin without voting until caught up.
+  bool join = false;
 };
 
 struct ReplicaStatus {
@@ -45,6 +58,10 @@ struct ReplicaStatus {
   raft::Index applied = 0;
   raft::Index last_index = 0;
   uint64_t apply_hash = 0;
+  raft::Index snapshot_index = 0;
+  uint64_t snapshots_installed = 0;
+  uint64_t snapshots_sent = 0;
+  bool joined = true;
 
   [[nodiscard]] std::string ToString() const;
 };
@@ -85,13 +102,23 @@ class Replica {
     net::Responder respond;
     std::chrono::steady_clock::time_point deadline;
   };
+  struct Read {
+    std::string key;
+    net::Responder respond;
+    std::chrono::steady_clock::time_point deadline;
+  };
 
   explicit Replica(ReplicaOptions options) : options_(std::move(options)) {}
 
   void Run();
   void ProposeBatch(std::vector<Proposal> batch);
   void ApplyCommitted();
+  void StartReads(std::vector<Read> reads);
+  void ServeReads();
+  void MaybeCompact();
   void ExpirePending();
+  std::shared_ptr<const raft::Snapshot> SnapshotSource();
+  void Fail(const net::Responder& respond, const Status& s) const;
   void PublishStatus();
   void RespondNotLeader(const net::Responder& respond) const;
 
@@ -105,8 +132,15 @@ class Replica {
   std::condition_variable inbox_cv_;
   std::deque<raft::Message> inbox_msgs_;
   std::vector<Proposal> inbox_proposals_;
+  std::vector<Read> inbox_reads_;
 
-  std::map<raft::Index, Pending> pending_;  // Raft thread only
+  // Raft thread only:
+  std::map<raft::Index, Pending> pending_;
+  uint64_t next_read_ctx_ = 0;
+  std::map<uint64_t, std::vector<Read>> unconfirmed_reads_;  // by ReadIndex ctx
+  std::multimap<raft::Index, Read> confirmed_reads_;         // by read index
+  std::shared_ptr<const raft::Snapshot> cached_snapshot_;
+  raft::Index installed_through_ = 0;
 
   mutable std::mutex status_mu_;
   ReplicaStatus status_;

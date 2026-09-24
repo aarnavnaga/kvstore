@@ -4,6 +4,9 @@
 //   kvserver --id=1 --peers=1=node1:7000,2=node2:7000,3=node3:7000 \
 //            --listen=0.0.0.0:7000 --data=/var/lib/kvstore
 //
+// After replacing a node's disk, restart it with --join so it cannot vote with a log
+// that has forgotten acknowledged entries.
+//
 // Single node, no replication (storage and network benchmarks):
 //   kvserver --standalone --listen=0.0.0.0:7000 --data=/var/lib/kvstore
 
@@ -91,6 +94,11 @@ int main(int argc, char** argv) {
   }
   options.data_dir = data;
   options.tick_ms = static_cast<int>(flags.GetInt("tick_ms", 10));
+  options.snapshot_threshold = static_cast<uint64_t>(flags.GetInt("snapshot_threshold", 10000));
+  options.snapshot_keep = static_cast<uint64_t>(flags.GetInt("snapshot_keep", 1000));
+  options.read_through_log = flags.Get("reads", "readindex") == "log";
+  // --join: this node's disk was wiped; rejoin as a non-voter until caught up.
+  options.join = flags.GetBool("join", false);
   std::unique_ptr<kv::server::Replica> replica;
   const kv::Status s = kv::server::Replica::Open(options, &replica);
   if (!s.ok()) {

@@ -15,7 +15,9 @@ std::string ReplicaStatus::ToString() const {
   std::ostringstream os;
   os << "id=" << id << " role=" << raft::RoleName(role) << " term=" << term << " leader=" << leader
      << " commit=" << commit << " applied=" << applied << " last_index=" << last_index
-     << " apply_hash=" << apply_hash;
+     << " apply_hash=" << apply_hash << " snapshot_index=" << snapshot_index
+     << " snapshots_installed=" << snapshots_installed << " snapshots_sent=" << snapshots_sent
+     << " joined=" << (joined ? 1 : 0);
   return os.str();
 }
 
@@ -38,6 +40,15 @@ Status Replica::Open(ReplicaOptions options, std::unique_ptr<Replica>* out) {
   c.heartbeat_ticks = o.heartbeat_ticks;
   c.seed = static_cast<uint64_t>(Clock::now().time_since_epoch().count());
   c.applied = r->sm_->applied_index();
+  c.join = o.join;
+  Replica* self = r.get();
+  c.snapshot_source = [self] { return self->SnapshotSource(); };
+  c.snapshot_sink = [self](const raft::Snapshot& snap) {
+    KV_RETURN_IF_ERROR(self->sm_->RestoreSnapshot(snap));
+    self->installed_through_ = snap.meta.index;
+    self->cached_snapshot_.reset();
+    return Status::OK();
+  };
   r->raft_ = std::make_unique<raft::RaftNode>(c, r->log_.get());
   r->PublishStatus();
   *out = std::move(r);
@@ -61,12 +72,21 @@ void Replica::Stop() {
   }
   transport_.reset();
   // Whatever is still waiting will never be answered by this process.
+  const Status down = Status::Unavailable("node shutting down; outcome unknown");
   for (auto& [index, p] : pending_) {
-    p.respond(net::Frame{net::MsgType::kResponse, 0,
-                         net::EncodeKvResponse(net::ResponseFromStatus(
-                             Status::Unavailable("node shutting down; outcome unknown")))});
+    Fail(p.respond, down);
   }
   pending_.clear();
+  for (auto& [ctx, reads] : unconfirmed_reads_) {
+    for (const Read& r : reads) {
+      Fail(r.respond, down);
+    }
+  }
+  unconfirmed_reads_.clear();
+  for (auto& [index, r] : confirmed_reads_) {
+    Fail(r.respond, down);
+  }
+  confirmed_reads_.clear();
 }
 
 // ---------------------------------------------------------------------------------------
@@ -106,10 +126,19 @@ void Replica::Handle(const net::Frame& frame, const net::Responder& respond) {
         reply(net::ResponseFromStatus(Status::InvalidArgument("reserved key prefix")));
         return;
       }
+      const auto deadline = Clock::now() + options_.request_timeout;
+      if (req.op == net::MsgType::kGet && !options_.read_through_log) {
+        {
+          std::lock_guard lk(inbox_mu_);
+          inbox_reads_.push_back(Read{std::move(req.key), respond, deadline});
+        }
+        inbox_cv_.notify_one();
+        return;
+      }
       Proposal p;
       p.cmd = Command{req.op, req.client_id, req.seq, std::move(req.key), std::move(req.value)};
       p.respond = respond;
-      p.deadline = Clock::now() + options_.request_timeout;
+      p.deadline = deadline;
       {
         std::lock_guard lk(inbox_mu_);
         inbox_proposals_.push_back(std::move(p));
@@ -131,13 +160,16 @@ void Replica::Run() {
   while (!stopping_) {
     std::deque<raft::Message> msgs;
     std::vector<Proposal> proposals;
+    std::vector<Read> reads;
     {
       std::unique_lock lk(inbox_mu_);
       inbox_cv_.wait_until(lk, next_tick, [&] {
-        return stopping_ || !inbox_msgs_.empty() || !inbox_proposals_.empty();
+        return stopping_ || !inbox_msgs_.empty() || !inbox_proposals_.empty() ||
+               !inbox_reads_.empty();
       });
       msgs.swap(inbox_msgs_);
       proposals.swap(inbox_proposals_);
+      reads.swap(inbox_reads_);
     }
     if (stopping_) {
       break;
@@ -157,10 +189,15 @@ void Replica::Run() {
     if (!proposals.empty()) {
       ProposeBatch(std::move(proposals));
     }
+    if (!reads.empty()) {
+      StartReads(std::move(reads));
+    }
     for (const raft::Message& m : raft_->TakeMessages()) {
       transport_->Send(m);
     }
     ApplyCommitted();
+    ServeReads();
+    MaybeCompact();
     ExpirePending();
     PublishStatus();
   }
@@ -195,6 +232,15 @@ void Replica::ProposeBatch(std::vector<Proposal> batch) {
 }
 
 void Replica::ApplyCommitted() {
+  if (installed_through_ > 0) {
+    // A snapshot replaced entries we were waiting on; their outcome is unknown here.
+    while (!pending_.empty() && pending_.begin()->first <= installed_through_) {
+      Fail(pending_.begin()->second.respond,
+           Status::Unavailable("superseded by a snapshot; outcome unknown"));
+      pending_.erase(pending_.begin());
+    }
+    installed_through_ = 0;
+  }
   const std::vector<raft::Entry> entries = raft_->TakeCommittedEntries();
   if (entries.empty()) {
     return;
@@ -226,22 +272,126 @@ void Replica::ApplyCommitted() {
   }
 }
 
-void Replica::ExpirePending() {
-  if (pending_.empty()) {
+// ---------------------------------------------------------------------------------------
+// Linearizable reads (ReadIndex)
+
+void Replica::StartReads(std::vector<Read> reads) {
+  const uint64_t ctx = ++next_read_ctx_;
+  // One ReadIndex round (one heartbeat to every follower) covers every GET that arrived
+  // since the last loop iteration.
+  if (!raft_->ReadIndex(ctx).ok()) {
+    for (const Read& r : reads) {
+      RespondNotLeader(r.respond);
+    }
     return;
   }
+  unconfirmed_reads_[ctx] = std::move(reads);
+}
+
+void Replica::ServeReads() {
+  for (const auto& rs : raft_->TakeReadStates()) {
+    const auto it = unconfirmed_reads_.find(rs.ctx);
+    if (it == unconfirmed_reads_.end()) {
+      continue;
+    }
+    for (Read& r : it->second) {
+      confirmed_reads_.emplace(rs.index, std::move(r));
+    }
+    unconfirmed_reads_.erase(it);
+  }
+  if (raft_->role() != raft::Role::kLeader && !unconfirmed_reads_.empty()) {
+    // Leadership lost before the heartbeat round confirmed these; retrying is safe.
+    for (auto& [ctx, reads] : unconfirmed_reads_) {
+      for (const Read& r : reads) {
+        RespondNotLeader(r.respond);
+      }
+    }
+    unconfirmed_reads_.clear();
+  }
+  // A confirmed read is served once the state machine has caught up to its read index.
+  // That holds even if leadership was lost since: the read was linearizable at the
+  // moment of confirmation, which lies between its invocation and this response.
+  const raft::Index applied = sm_->applied_index();
+  while (!confirmed_reads_.empty() && confirmed_reads_.begin()->first <= applied) {
+    Read r = std::move(confirmed_reads_.begin()->second);
+    confirmed_reads_.erase(confirmed_reads_.begin());
+    net::KvResponse resp;
+    const Status s = sm_->Get(r.key, &resp.value);
+    if (!s.ok()) {
+      resp = net::ResponseFromStatus(s);
+    }
+    r.respond(net::Frame{net::MsgType::kResponse, 0, net::EncodeKvResponse(resp)});
+  }
+}
+
+// ---------------------------------------------------------------------------------------
+// Snapshots
+
+std::shared_ptr<const raft::Snapshot> Replica::SnapshotSource() {
+  if (cached_snapshot_ && cached_snapshot_->meta.index == sm_->applied_index()) {
+    return cached_snapshot_;
+  }
+  auto snap = std::make_shared<raft::Snapshot>();
+  const Status s = sm_->CreateSnapshot(snap.get());
+  if (!s.ok()) {
+    std::fprintf(stderr, "replica: snapshot failed: %s\n", s.ToString().c_str());
+    return nullptr;
+  }
+  cached_snapshot_ = std::move(snap);
+  return cached_snapshot_;
+}
+
+void Replica::MaybeCompact() {
+  const raft::Index applied = sm_->applied_index();
+  const raft::Index snap = log_->Snapshot().index;
+  if (applied < snap + options_.snapshot_threshold || applied <= options_.snapshot_keep) {
+    return;
+  }
+  // The DB is unsynced; make the applied state durable before the log forgets it.
+  Status s = sm_->Sync();
+  if (s.ok()) {
+    s = raft_->Compact(applied - options_.snapshot_keep);
+  }
+  if (!s.ok()) {
+    std::fprintf(stderr, "replica: compaction failed: %s\n", s.ToString().c_str());
+    std::abort();
+  }
+}
+
+void Replica::ExpirePending() {
   const auto now = Clock::now();
+  for (auto it = confirmed_reads_.begin(); it != confirmed_reads_.end();) {
+    if (it->second.deadline <= now) {
+      Fail(it->second.respond, Status::Timeout("read not served in time"));
+      it = confirmed_reads_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto& [ctx, reads] : unconfirmed_reads_) {
+    for (auto it = reads.begin(); it != reads.end();) {
+      if (it->deadline <= now) {
+        Fail(it->respond, Status::Timeout("read not confirmed in time"));
+        it = reads.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
   for (auto it = pending_.begin(); it != pending_.end();) {
     if (it->second.deadline <= now) {
       // The entry may still commit later: the outcome is unknown, so say exactly that.
-      it->second.respond(net::Frame{net::MsgType::kResponse, 0,
-                                    net::EncodeKvResponse(net::ResponseFromStatus(
-                                        Status::Timeout("not committed in time")))});
+      Fail(it->second.respond, Status::Timeout("not committed in time"));
       it = pending_.erase(it);
     } else {
       ++it;
     }
   }
+}
+
+void Replica::Fail(const net::Responder& respond, const Status& s) const {
+  respond(
+      net::Frame{net::MsgType::kResponse, 0, net::EncodeKvResponse(net::ResponseFromStatus(s))});
 }
 
 void Replica::RespondNotLeader(const net::Responder& respond) const {
@@ -264,6 +414,10 @@ void Replica::PublishStatus() {
   s.applied = sm_->applied_index();
   s.last_index = raft_->last_index();
   s.apply_hash = sm_->apply_hash();
+  s.snapshot_index = log_->Snapshot().index;
+  s.snapshots_installed = raft_->snapshots_installed();
+  s.snapshots_sent = raft_->snapshots_sent();
+  s.joined = raft_->joined();
   std::lock_guard lk(status_mu_);
   status_ = s;
 }
