@@ -329,6 +329,59 @@ it with ReadIndex.
 | Follower sets commit to the leader's commit, not `min(leader commit, last new entry)` | only after two test changes (bug log #7): "node 2 committed through index 2 but its log ends at 1" |
 | Leader commits an earlier term's entry by counting replicas (the paper's Figure 8) | only after harsher fault schedules (bug log #7): "index 29 applied as term 8 elsewhere but term 12 on node 1" |
 
+## Snapshots, linearizable reads and rejoining (M6)
+
+**Log compaction.** Once 10,000 entries have been applied since the last snapshot, a node
+flushes its LSM tree (the DB runs unsynced, so this is what makes the applied state
+durable) and then drops all but the last 1,000 entries from its Raft log. Keeping a tail
+lets a follower that is briefly behind catch up from the log instead of needing a full
+snapshot. There is no separate snapshot file: the LSM tree *is* the snapshot, and a
+serialized copy is produced only when a follower actually needs one.
+
+**InstallSnapshot.** When a follower needs entries the leader has compacted away, the
+leader streams the state machine to it in 1 MB chunks, stop-and-wait: the next chunk
+goes out only when an acknowledgement *advances* the offset, and a chunk is resent only
+after going unanswered for half an election timeout. On the follower, the state machine
+restores the snapshot durably *before* Raft resets its log. A crash in between leaves a
+state machine ahead of its log, which recovery handles; the other order could leave a
+log that starts after the state machine ends, which nothing can repair.
+
+The restore builds the new LSM tree in a side directory and swaps it in with two
+renames. If the process dies between them, startup finds the new tree and finishes the
+swap; if it dies before them, the half-built tree is discarded.
+
+**ReadIndex instead of reading through the log.** In M5 a GET was a log entry: correct,
+but every read paid for a disk append, an `fsync` and replication. Now the leader records
+its commit index as the read index, sends one heartbeat round to confirm it is still the
+leader, waits until it has applied through the read index, and reads locally. All GETs
+that arrive in the same loop iteration share one heartbeat round. Two details carry the
+correctness:
+
+- A new leader does not serve reads until its own no-op has committed. Before that, its
+  commit index may lag entries a previous leader already committed.
+- Confirmation needs a response from a majority in the leader's *current* term. A leader
+  stranded on the minority side of a partition never gets one, so it never answers.
+
+**Rejoining with a wiped disk.** Raft assumes stable storage. A node whose disk is
+replaced has forgotten its votes and possibly entries it acknowledged, so it could vote
+twice in one term, or help elect a leader that is missing committed entries. Restarted
+with `--join`, a node stays a silent follower (no voting, no campaigning) until it has
+committed an entry from the current leader's term. By Log Matching its log then contains
+every entry committed before it, and it votes normally from then on. The joining flag is
+stored durably next to the term and vote, so a crash before catching up does not quietly
+turn it back into a voter.
+
+**Verification.**
+
+| Test | Result |
+|---|---|
+| Simulator: 2,000 randomized runs with compaction every 5 to 25 entries, multi-chunk snapshots, disk wipes, crashes, partitions, loss, and a read stream | 20,469 snapshots installed, 119,808 reads checked, 0 violations |
+| Simulator: every read's index vs. the highest commit index anywhere when the read was issued | never lower (no stale read) |
+| Simulator: leader partitioned with one follower of five, read issued | never confirmed |
+| Real cluster: node wiped and restarted with `--join` after the leader compacted past index 400 | installs a snapshot, rejoins as a voter, has every key |
+| Real cluster: 2,000 writes with a 100-entry threshold, then a full restart | log stays within 110 entries of the snapshot; data intact |
+| Real cluster: 200 GETs | the leader's last log index does not move |
+
 ## Bug log
 
 | # | Milestone | Symptom | Cause | Caught by |
@@ -340,3 +393,6 @@ it with ReadIndex.
 | 5 | M4 | ASan heap-use-after-free in a Raft unit test; release builds passed | The test kept a pointer into the vector returned by `TakeMessages()`, a temporary destroyed at the end of the statement | ASan and TSan |
 | 6 | M4 | CI lint failed on code that "passed" lint locally | Local clang-tidy colorizes output, so `grep ' error: '` matched nothing and the local gate passed silently since M2. Lint now runs with `--use-color=false` and is judged by exit code | CI |
 | 7 | M5 | Two deliberately injected Raft bugs passed 500 randomized runs | Every append carried the follower's whole missing log (tiny commands, 1 MB batches), so "commit past what the leader vouched for" never had a partial append to bite; and leaders rarely died with entries half-replicated, which Figure 8 needs. Half the runs now send one entry per message, leaders are killed on purpose, churn is 3x higher, and the simulator checks that commit never passes the end of a node's log | Mutation testing |
+| 8 | M6 | A wiped follower never caught up; the leader resent the same append forever | The leader clamps its retry point to `match + 1`, assuming follower logs never shrink. A wiped disk breaks that. A rejection now lowers `match`, which is always safe | Simulator |
+| 9 | M6 | Randomized snapshot runs took seconds each and looked hung | Each heartbeat resent the current snapshot chunk, and the ack for every resend started another chain of chunks, so concurrent transfers multiplied for as long as the snapshot was in flight. Now strictly stop-and-wait: only an ack that advances the offset sends more, and retransmission waits for a timeout | A hung test, then simulator message tracing |
+| 10 | M6 | State machine safety violation: "index 178 applied as term 2 elsewhere but term 3 on node 2" | A wiped node in join mode crashed and restarted before catching up; join mode was a startup flag, so it came back as a voter with an empty log and helped elect a leader missing committed entries. The joining flag is now persisted with the term and vote | Simulator |
