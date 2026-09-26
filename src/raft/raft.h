@@ -69,6 +69,9 @@ class RaftNode {
 
   // Propose appends a command to the leader's log. Returns NotLeader on a follower.
   Status Propose(std::string data, Index* index, Term* term);
+  // ProposeBatch appends several commands with one storage write (one fsync), giving
+  // them consecutive indexes starting at *first.
+  Status ProposeBatch(std::vector<std::string> data, Index* first, Term* term);
 
   // TakeMessages returns and clears the messages queued for peers.
   std::vector<Message> TakeMessages();

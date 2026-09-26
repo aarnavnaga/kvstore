@@ -18,3 +18,6 @@ target_compile_definitions(crash_test PRIVATE KV_CRASH_WRITER="$<TARGET_FILE:cra
 kv_test(compaction_test compaction_test.cc)
 kv_test(net_test net_test.cc)
 kv_test(raft_election_test raft_election_test.cc)
+kv_test(raft_storage_test raft_storage_test.cc)
+kv_test(raft_replication_test raft_replication_test.cc)
+kv_test(cluster_test cluster_test.cc)

@@ -9,6 +9,7 @@
 //   Election safety     at most one leader per term, ever
 //   State machine safety no two nodes apply different entries at the same index
 //   Apply order         every node applies a contiguous prefix of the log
+//   Commit bound        no node's commit index passes the end of its own log
 
 #include <algorithm>
 #include <functional>
@@ -211,6 +212,12 @@ class SimCluster {
     RaftNode* r = raft(id);
     for (Message& m : r->TakeMessages()) {
       Send(std::move(m));
+    }
+    if (r->commit_index() > r->last_index()) {
+      Fail("node " + std::to_string(id) + " committed through index " +
+           std::to_string(r->commit_index()) + " but its log ends at " +
+           std::to_string(r->last_index()));
+      return;
     }
     ApplyCommitted(id);
     CheckLeader(id);
