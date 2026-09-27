@@ -1,5 +1,9 @@
 #include "server/replica.h"
 
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
@@ -17,7 +21,7 @@ std::string ReplicaStatus::ToString() const {
      << " commit=" << commit << " applied=" << applied << " last_index=" << last_index
      << " apply_hash=" << apply_hash << " snapshot_index=" << snapshot_index
      << " snapshots_installed=" << snapshots_installed << " snapshots_sent=" << snapshots_sent
-     << " joined=" << (joined ? 1 : 0);
+     << " joined=" << (joined ? 1 : 0) << " ticks=" << ticks;
   return os.str();
 }
 
@@ -27,6 +31,10 @@ Status Replica::Open(ReplicaOptions options, std::unique_ptr<Replica>* out) {
   }
   std::unique_ptr<Replica> r(new Replica(std::move(options)));
   const ReplicaOptions& o = r->options_;
+  r->wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (r->wake_fd_ < 0) {
+    return Status::IOErrorFromErrno("eventfd");
+  }
   KV_RETURN_IF_ERROR(raft::FileLogStorage::Open(JoinPath(o.data_dir, "raft"), &r->log_));
   KV_RETURN_IF_ERROR(KvStateMachine::Open(o.db, JoinPath(o.data_dir, "db"), &r->sm_));
 
@@ -55,7 +63,17 @@ Status Replica::Open(ReplicaOptions options, std::unique_ptr<Replica>* out) {
   return Status::OK();
 }
 
-Replica::~Replica() { Stop(); }
+Replica::~Replica() {
+  Stop();
+  if (wake_fd_ >= 0) {
+    ::close(wake_fd_);
+  }
+}
+
+void Replica::Wake() {
+  const uint64_t one = 1;
+  (void)!::write(wake_fd_, &one, sizeof(one));  // a saturated counter still wakes
+}
 
 void Replica::Start() {
   transport_ = std::make_unique<PeerTransport>(options_.id, options_.peers);
@@ -66,7 +84,7 @@ void Replica::Stop() {
   if (stopping_.exchange(true)) {
     return;
   }
-  inbox_cv_.notify_all();
+  Wake();
   if (thread_.joinable()) {
     thread_.join();
   }
@@ -104,7 +122,7 @@ void Replica::Handle(const net::Frame& frame, const net::Responder& respond) {
           std::lock_guard lk(inbox_mu_);
           inbox_msgs_.push_back(std::move(m));
         }
-        inbox_cv_.notify_one();
+        Wake();
       }
       return;  // one-way: peers do not wait for a frame-level reply
     }
@@ -132,7 +150,7 @@ void Replica::Handle(const net::Frame& frame, const net::Responder& respond) {
           std::lock_guard lk(inbox_mu_);
           inbox_reads_.push_back(Read{std::move(req.key), respond, deadline});
         }
-        inbox_cv_.notify_one();
+        Wake();
         return;
       }
       Proposal p;
@@ -143,7 +161,7 @@ void Replica::Handle(const net::Frame& frame, const net::Responder& respond) {
         std::lock_guard lk(inbox_mu_);
         inbox_proposals_.push_back(std::move(p));
       }
-      inbox_cv_.notify_one();
+      Wake();
       return;
     }
     default:
@@ -161,12 +179,15 @@ void Replica::Run() {
     std::deque<raft::Message> msgs;
     std::vector<Proposal> proposals;
     std::vector<Read> reads;
+    const auto wait =
+        std::chrono::duration_cast<std::chrono::milliseconds>(next_tick - Clock::now());
+    pollfd p{wake_fd_, POLLIN, 0};
+    if (::poll(&p, 1, static_cast<int>(std::max<int64_t>(0, wait.count()))) > 0) {
+      uint64_t drained = 0;
+      (void)!::read(wake_fd_, &drained, sizeof(drained));
+    }
     {
-      std::unique_lock lk(inbox_mu_);
-      inbox_cv_.wait_until(lk, next_tick, [&] {
-        return stopping_ || !inbox_msgs_.empty() || !inbox_proposals_.empty() ||
-               !inbox_reads_.empty();
-      });
+      std::lock_guard lk(inbox_mu_);
       msgs.swap(inbox_msgs_);
       proposals.swap(inbox_proposals_);
       reads.swap(inbox_reads_);
@@ -181,6 +202,7 @@ void Replica::Run() {
     const auto now = Clock::now();
     if (now >= next_tick) {
       raft_->Tick();
+      ++ticks_;
       next_tick += tick;
       if (next_tick < now) {
         next_tick = now + tick;  // fell behind (e.g. a slow fsync); don't burst ticks
@@ -276,6 +298,12 @@ void Replica::ApplyCommitted() {
 // Linearizable reads (ReadIndex)
 
 void Replica::StartReads(std::vector<Read> reads) {
+  if (options_.unsafe_local_reads) {
+    for (Read& r : reads) {
+      confirmed_reads_.emplace(0, std::move(r));  // served right away, from whatever we have
+    }
+    return;
+  }
   const uint64_t ctx = ++next_read_ctx_;
   // One ReadIndex round (one heartbeat to every follower) covers every GET that arrived
   // since the last loop iteration.
@@ -418,6 +446,7 @@ void Replica::PublishStatus() {
   s.snapshots_installed = raft_->snapshots_installed();
   s.snapshots_sent = raft_->snapshots_sent();
   s.joined = raft_->joined();
+  s.ticks = ticks_;
   std::lock_guard lk(status_mu_);
   status_ = s;
 }

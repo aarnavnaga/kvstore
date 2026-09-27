@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <deque>
 #include <map>
 #include <memory>
@@ -47,6 +46,11 @@ struct ReplicaOptions {
 
   // join: this node's data was wiped; rejoin without voting until caught up.
   bool join = false;
+
+  // UNSAFE, for validating the chaos harness only: answer GETs from local state on any
+  // node, skipping ReadIndex. A follower or a deposed leader then serves stale reads,
+  // which the linearizability checker must catch.
+  bool unsafe_local_reads = false;
 };
 
 struct ReplicaStatus {
@@ -62,6 +66,7 @@ struct ReplicaStatus {
   uint64_t snapshots_installed = 0;
   uint64_t snapshots_sent = 0;
   bool joined = true;
+  uint64_t ticks = 0;  // Raft clock ticks so far; the chaos harness compares clock rates
 
   [[nodiscard]] std::string ToString() const;
 };
@@ -119,6 +124,7 @@ class Replica {
   void ExpirePending();
   std::shared_ptr<const raft::Snapshot> SnapshotSource();
   void Fail(const net::Responder& respond, const Status& s) const;
+  void Wake();
   void PublishStatus();
   void RespondNotLeader(const net::Responder& respond) const;
 
@@ -128,8 +134,12 @@ class Replica {
   std::unique_ptr<raft::RaftNode> raft_;
   std::unique_ptr<PeerTransport> transport_;
 
+  // The inbox is guarded by a mutex; producers signal an eventfd and the Raft thread
+  // waits on it with poll() and a relative timeout until the next tick. (A condition
+  // variable's absolute deadline bypasses libfaketime, which the clock-skew scenario
+  // relies on to run one node's clock at 2x; see DESIGN.md bug log #11.)
   std::mutex inbox_mu_;
-  std::condition_variable inbox_cv_;
+  int wake_fd_ = -1;
   std::deque<raft::Message> inbox_msgs_;
   std::vector<Proposal> inbox_proposals_;
   std::vector<Read> inbox_reads_;
@@ -141,6 +151,7 @@ class Replica {
   std::multimap<raft::Index, Read> confirmed_reads_;         // by read index
   std::shared_ptr<const raft::Snapshot> cached_snapshot_;
   raft::Index installed_through_ = 0;
+  uint64_t ticks_ = 0;
 
   mutable std::mutex status_mu_;
   ReplicaStatus status_;
