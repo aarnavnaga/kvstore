@@ -23,6 +23,9 @@ struct ClientOptions {
   net::Millis backoff_max{500};
   // 0 picks a random id. Two clients must never share one.
   uint64_t client_id = 0;
+  // sticky_leader remembers the leader between operations. Off, every operation starts
+  // at the configured servers again (it still follows redirects within the operation).
+  bool sticky_leader = true;
 };
 
 // KvClient talks to a cluster: it follows NotLeader redirects, retries on connection
