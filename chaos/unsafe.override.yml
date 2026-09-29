@@ -1,0 +1,6 @@
+# Negative control: every node serves GETs from local state without ReadIndex. Used only
+# to prove the harness catches stale reads (chaos/run.sh with UNSAFE=1).
+services:
+  node1: { environment: { KV_EXTRA_ARGS: "--snapshot_threshold=500 --snapshot_keep=50 --unsafe_local_reads" } }
+  node2: { environment: { KV_EXTRA_ARGS: "--snapshot_threshold=500 --snapshot_keep=50 --unsafe_local_reads" } }
+  node3: { environment: { KV_EXTRA_ARGS: "--snapshot_threshold=500 --snapshot_keep=50 --unsafe_local_reads" } }
