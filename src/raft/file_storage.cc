@@ -1,6 +1,7 @@
 #include "raft/file_storage.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 
 #include "common/coding.h"
@@ -184,7 +185,12 @@ Status FileLogStorage::Append(const std::vector<Entry>& entries) {
     buf.append(storage::EncodeRecord(EncodeEntry(e)));
   }
   KV_RETURN_IF_ERROR(log_->Append(buf));
+  const auto t0 = std::chrono::steady_clock::now();
   KV_RETURN_IF_ERROR(log_->Sync());
+  sync_nanos_ += static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
+          .count());
+  ++appends_;
   entries_.insert(entries_.end(), entries.begin(), entries.end());
   return Status::OK();
 }

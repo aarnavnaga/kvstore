@@ -7,7 +7,9 @@
 
 namespace kv::server {
 
-PeerTransport::PeerTransport(raft::NodeId self, const std::map<raft::NodeId, std::string>& peers) {
+PeerTransport::PeerTransport(raft::NodeId self, const std::map<raft::NodeId, std::string>& peers,
+                             std::shared_ptr<net::TlsContext> tls)
+    : tls_(std::move(tls)) {
   for (const auto& [id, addr] : peers) {
     if (id == self) {
       continue;
@@ -79,7 +81,7 @@ void PeerTransport::Run(Peer* peer) {
       batch.swap(peer->queue);
     }
     if (!conn) {
-      if (!net::Connection::Dial(peer->addr, milliseconds(500), &conn).ok()) {
+      if (!net::Connection::Dial(peer->addr, milliseconds(500), &conn, tls_).ok()) {
         // Peer unreachable. Drop this batch rather than letting it go stale; Raft
         // resends what matters. Back off so a dead peer costs little CPU.
         std::unique_lock lk(peer->mu);

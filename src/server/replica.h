@@ -51,6 +51,9 @@ struct ReplicaOptions {
   // node, skipping ReadIndex. A follower or a deposed leader then serves stale reads,
   // which the linearizability checker must catch.
   bool unsafe_local_reads = false;
+
+  // Mutual TLS for connections to peers (the server side is configured on net::Server).
+  std::shared_ptr<net::TlsContext> tls;
 };
 
 struct ReplicaStatus {
@@ -67,6 +70,12 @@ struct ReplicaStatus {
   uint64_t snapshots_sent = 0;
   bool joined = true;
   uint64_t ticks = 0;  // Raft clock ticks so far; the chaos harness compares clock rates
+  uint64_t leader_changes = 0;
+  uint64_t proposals = 0;         // client commands proposed by this node as leader
+  uint64_t proposal_batches = 0;  // log appends they were grouped into
+  uint64_t log_appends = 0;       // fsynced Raft log appends (leader and follower)
+  double log_sync_seconds = 0;    // total time in those fsyncs
+  uint64_t peer_messages_dropped = 0;
 
   [[nodiscard]] std::string ToString() const;
 };
@@ -152,6 +161,10 @@ class Replica {
   std::shared_ptr<const raft::Snapshot> cached_snapshot_;
   raft::Index installed_through_ = 0;
   uint64_t ticks_ = 0;
+  uint64_t leader_changes_ = 0;
+  raft::NodeId last_leader_ = raft::kNoNode;
+  uint64_t proposals_ = 0;
+  uint64_t proposal_batches_ = 0;
 
   mutable std::mutex status_mu_;
   ReplicaStatus status_;
