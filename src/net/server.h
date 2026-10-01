@@ -11,6 +11,7 @@
 #include "common/status.h"
 #include "common/thread_pool.h"
 #include "net/frame.h"
+#include "net/tls.h"
 
 namespace kv::net {
 
@@ -31,6 +32,8 @@ struct ServerOptions {
   // A client that stops reading has this much response data buffered before it is
   // disconnected, so one slow consumer cannot exhaust server memory.
   size_t max_output_buffer = 64u << 20;
+  // When set, every connection must complete a mutual-TLS handshake first.
+  std::shared_ptr<TlsContext> tls;
 };
 
 struct ServerStats {
@@ -39,6 +42,7 @@ struct ServerStats {
   uint64_t frames_in = 0;
   uint64_t frames_out = 0;
   uint64_t protocol_errors = 0;
+  uint64_t tls_failures = 0;  // handshakes refused (no or untrusted certificate)
 };
 
 // Server is a non-blocking TCP server. One IO thread accepts; each of io_threads runs an
@@ -84,6 +88,7 @@ class Server {
   std::atomic<uint64_t> frames_in_{0};
   std::atomic<uint64_t> frames_out_{0};
   std::atomic<uint64_t> protocol_errors_{0};
+  std::atomic<uint64_t> tls_failures_{0};
 };
 
 // ParseHostPort splits "host:port". Returns false if the port is missing or invalid.

@@ -33,14 +33,19 @@ add_library(kv_net
   net/frame.cc
   net/protocol.cc
   net/server.cc
+  net/tls.cc
 )
-target_link_libraries(kv_net PUBLIC kv_common)
+find_package(OpenSSL 3 REQUIRED)
+target_link_libraries(kv_net PUBLIC kv_common OpenSSL::SSL OpenSSL::Crypto)
 
 add_library(kv_client client/kv_client.cc)
 target_link_libraries(kv_client PUBLIC kv_net)
 
 add_library(kv_server_lib
+  server/admin_http.cc
   server/kv_state_machine.cc
+  server/metrics.cc
+  server/node_metrics.cc
   server/peer_transport.cc
   server/replica.cc
   server/standalone_service.cc

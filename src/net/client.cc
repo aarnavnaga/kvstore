@@ -4,10 +4,13 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 
 #include "net/server.h"
@@ -16,6 +19,22 @@ namespace kv::net {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+}  // namespace
+
+void EnableKeepalive(int fd, int idle_seconds) {
+  // Probe an idle connection after idle_seconds, then every second; drop it after two
+  // unanswered probes. Catches dead peers on connections with nothing to send.
+  const int one = 1;
+  const int interval = 1;
+  const int count = 2;
+  ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+  ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_seconds, sizeof(idle_seconds));
+  ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+  ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+}
+
+namespace {
 
 // WaitFd waits until fd is ready for events or the deadline passes.
 Status WaitFd(int fd, short events, Clock::time_point deadline) {
@@ -37,7 +56,9 @@ Status WaitFd(int fd, short events, Clock::time_point deadline) {
 
 }  // namespace
 
-Status Connection::Dial(const std::string& addr, Millis timeout, std::unique_ptr<Connection>* out) {
+Status Connection::Dial(const std::string& addr, Millis timeout, std::unique_ptr<Connection>* out,
+                        const std::shared_ptr<TlsContext>& tls) {
+  const auto deadline = Clock::now() + timeout;
   std::string host;
   uint16_t port = 0;
   if (!ParseHostPort(addr, &host, &port)) {
@@ -77,11 +98,42 @@ Status Connection::Dial(const std::string& addr, Millis timeout, std::unique_ptr
   }
   const int one = 1;
   ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-  out->reset(new Connection(fd, addr));
+  // A peer whose IP vanished (a rescheduled Kubernetes pod) never resets the connection:
+  // writes are buffered and retransmitted for ~15 minutes before failing. Fail the socket
+  // once data has gone unacknowledged for 3 s instead, so the next Dial re-resolves DNS.
+  const int user_timeout_ms = 3000;
+  ::setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms, sizeof(user_timeout_ms));
+  EnableKeepalive(fd, 2);
+  std::unique_ptr<Connection> conn(new Connection(fd, addr));
+  if (tls) {
+    conn->ssl_ = tls->NewClient(fd);
+    KV_RETURN_IF_ERROR(conn->Handshake(deadline));
+  }
+  *out = std::move(conn);
   return Status::OK();
 }
 
-Connection::~Connection() { ::close(fd_); }
+Status Connection::Handshake(Clock::time_point deadline) {
+  while (true) {
+    const int rc = SSL_do_handshake(ssl_);
+    if (rc == 1) {
+      return Status::OK();
+    }
+    const int err = SSL_get_error(ssl_, rc);
+    if (err == SSL_ERROR_WANT_READ) {
+      KV_RETURN_IF_ERROR(WaitFd(fd_, POLLIN, deadline));
+    } else if (err == SSL_ERROR_WANT_WRITE) {
+      KV_RETURN_IF_ERROR(WaitFd(fd_, POLLOUT, deadline));
+    } else {
+      return Status::Unavailable("TLS handshake with " + addr_ + ": " + TlsError());
+    }
+  }
+}
+
+Connection::~Connection() {
+  SSL_free(ssl_);
+  ::close(fd_);
+}
 
 Status Connection::Send(const Frame& frame, Millis timeout) {
   return SendBytes(EncodeFrame(frame), timeout);
@@ -91,6 +143,20 @@ Status Connection::SendBytes(std::string_view bytes, Millis timeout) {
   const auto deadline = Clock::now() + timeout;
   size_t sent = 0;
   while (sent < bytes.size()) {
+    if (ssl_ != nullptr) {
+      const int n = SSL_write(ssl_, bytes.data() + sent,
+                              static_cast<int>(std::min<size_t>(bytes.size() - sent, 1u << 30)));
+      if (n > 0) {
+        sent += static_cast<size_t>(n);
+        continue;
+      }
+      const int err = SSL_get_error(ssl_, n);
+      if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
+        KV_RETURN_IF_ERROR(WaitFd(fd_, err == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN, deadline));
+        continue;
+      }
+      return Status::Unavailable("TLS send to " + addr_ + ": " + TlsError());
+    }
     const ssize_t n = ::send(fd_, bytes.data() + sent, bytes.size() - sent, MSG_NOSIGNAL);
     if (n > 0) {
       sent += static_cast<size_t>(n);
@@ -119,6 +185,20 @@ Status Connection::Receive(Frame* frame, Millis timeout) {
         return Status::Corruption("bad frame from " + addr_ + ": " + decoder_.error());
       case FrameDecoder::Result::kNeedMore:
         break;
+    }
+    if (ssl_ != nullptr) {
+      const int n = SSL_read(ssl_, buf, sizeof(buf));
+      if (n > 0) {
+        decoder_.Feed(std::string_view(buf, static_cast<size_t>(n)));
+        continue;
+      }
+      const int err = SSL_get_error(ssl_, n);
+      if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+        KV_RETURN_IF_ERROR(WaitFd(fd_, err == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT, deadline));
+        continue;
+      }
+      ERR_clear_error();
+      return Status::Unavailable("TLS connection to " + addr_ + " closed");
     }
     const ssize_t n = ::recv(fd_, buf, sizeof(buf), 0);
     if (n > 0) {
