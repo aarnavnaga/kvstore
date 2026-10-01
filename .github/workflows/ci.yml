@@ -83,3 +83,14 @@ jobs:
             mkdir -p corpus-$f
             ./build/fuzz/${f}_fuzzer -max_total_time=60 -print_final_stats=1 corpus-$f
           done
+
+  checker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: Linearizability checker tests
+        working-directory: chaos/checker
+        run: go vet ./... && go test ./...
