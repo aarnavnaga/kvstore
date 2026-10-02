@@ -1,0 +1,12 @@
+kvstore: {{ .Values.replicas }} Raft voters{{ if .Values.tls.enabled }}, mutual TLS on every connection{{ end }}.
+
+Status of every node (from inside a pod, using the cluster certificate):
+  kubectl exec {{ include "kvstore.fullname" . }}-0 -- kvcli \
+    --servers={{ include "kvstore.peers" . | replace "1=" "" | replace "2=" "" | replace "3=" "" | replace "4=" "" | replace "5=" "" }} \
+    {{- if .Values.tls.enabled }} --tls_ca=/etc/kvstore/tls/ca.crt --tls_cert=/etc/kvstore/tls/tls.crt --tls_key=/etc/kvstore/tls/tls.key{{ end }} status
+{{- if .Values.monitoring.enabled }}
+
+Dashboard:
+  kubectl port-forward svc/{{ include "kvstore.fullname" . }}-grafana 3000
+  open http://localhost:3000
+{{- end }}

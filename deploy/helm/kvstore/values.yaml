@@ -1,0 +1,35 @@
+# Number of Raft voters. Use an odd number (3 or 5); the cluster tolerates the loss of
+# (replicas - 1) / 2 of them.
+replicas: 3
+
+image:
+  repository: kvstore
+  tag: dev
+  pullPolicy: IfNotPresent
+
+# Raft clock tick. Election timeouts are 15-30 ticks, heartbeats every 3.
+tickMs: 10
+
+# Snapshot and compact the Raft log every snapshotThreshold applied entries.
+snapshotThreshold: 10000
+
+tls:
+  # Mutual TLS between nodes and for every client. The chart generates a private CA and
+  # a certificate for the cluster on first install and keeps them across upgrades.
+  enabled: true
+  certValidityDays: 365
+
+persistence:
+  size: 2Gi
+  storageClass: ""  # empty: the cluster default
+
+resources:
+  requests: { cpu: 100m, memory: 128Mi }
+  limits: { memory: 512Mi }
+
+# Prometheus and Grafana with a provisioned dashboard. Off for production clusters that
+# already run their own monitoring.
+monitoring:
+  enabled: true
+  prometheusImage: prom/prometheus:v2.54.1
+  grafanaImage: grafana/grafana:11.2.0
