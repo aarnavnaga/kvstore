@@ -94,3 +94,22 @@ jobs:
       - name: Linearizability checker tests
         working-directory: chaos/checker
         run: go vet ./... && go test ./...
+
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the production image
+        run: docker build -t kvstore:ci -f deploy/docker/Dockerfile .
+      - name: Trivy (fail on critical CVEs)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: kvstore:ci
+          scanners: vuln
+          severity: CRITICAL
+          exit-code: "1"
+      - name: Helm chart renders
+        run: |
+          curl -fsSL https://get.helm.sh/helm-v3.16.1-linux-amd64.tar.gz | tar -xz -C /tmp
+          /tmp/linux-amd64/helm lint deploy/helm/kvstore
+          /tmp/linux-amd64/helm template test deploy/helm/kvstore > /dev/null
