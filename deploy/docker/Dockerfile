@@ -10,7 +10,7 @@ ENV CC=clang-18 CXX=clang++-18
 WORKDIR /src
 COPY CMakeLists.txt ./
 COPY src ./src
-RUN cmake -S . -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release -DKV_BUILD_TESTS=OFF \
+RUN cmake -S . -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release -DKV_BUILD_TESTS=OFF -DKV_BUILD_BENCH=OFF \
     && cmake --build /build --target kvserver kvcli kvhistory \
     && strip /build/src/kvserver /build/src/kvcli /build/src/kvhistory
 
