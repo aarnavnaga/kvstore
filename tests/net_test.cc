@@ -98,6 +98,15 @@ TEST(Protocol, RoundTrips) {
   EXPECT_EQ(r2.leader_hint, "node2:7000");
 }
 
+// The Java client asserts exactly these bytes too (WireTest.putFrameMatchesGoldenBytes).
+TEST(Protocol, GoldenBytesMatchJavaClient) {
+  const std::string payload = EncodeKvRequest({MsgType::kPut, "k", "v", 42, 1});
+  const std::string frame = EncodeFrame(Frame{MsgType::kPut, 7, payload});
+  const unsigned char golden[] = {0x0f, 0x00, 0x00, 0x00, 0x02, 0x07, 0x00, 0x00, 0x00, 0x00,
+                                  0x00, 0x00, 0x00, 0x2a, 0x01, 0x01, 0x6b, 0x01, 0x76};
+  EXPECT_EQ(frame, std::string(reinterpret_cast<const char*>(golden), sizeof(golden)));
+}
+
 class ServerTest : public ::testing::Test {
  protected:
   void SetUp() override {
