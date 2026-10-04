@@ -32,6 +32,9 @@ struct Entry {
 struct HardState {
   Term term = 0;
   NodeId vote = kNoNode;
+  // joining survives restarts: a wiped node that crashes again before catching up must
+  // not come back as a voter just because nobody passed --join a second time.
+  bool joining = false;
 
   bool operator==(const HardState&) const = default;
 };
@@ -39,6 +42,12 @@ struct HardState {
 struct SnapshotMeta {
   Index index = 0;  // last entry the snapshot covers
   Term term = 0;    // that entry's term
+};
+
+// Snapshot is the state machine's full state as of meta.index, as an opaque blob.
+struct Snapshot {
+  SnapshotMeta meta;
+  std::string data;
 };
 
 enum class MsgKind : uint8_t {

@@ -22,7 +22,15 @@ namespace kv::test {
 
 class TestCluster {
  public:
-  explicit TestCluster(int n, int tick_ms = 10) : tick_ms_(tick_ms) {
+  struct Options {
+    int tick_ms = 10;
+    uint64_t snapshot_threshold = 10000;
+    uint64_t snapshot_keep = 1000;
+    bool read_through_log = false;
+  };
+
+  explicit TestCluster(int n) : TestCluster(n, Options{}) {}
+  TestCluster(int n, Options options) : options_(options) {
     // Bind every server first (port 0) so each node knows all addresses up front.
     for (int i = 1; i <= n; ++i) {
       auto& node = nodes_[static_cast<raft::NodeId>(i)];
@@ -58,6 +66,15 @@ class TestCluster {
     Stop(id);
     StartServer(id, nodes_[id].port);
     StartReplica(id);
+  }
+
+  // Wipe deletes the node's data directory and restarts it in join mode, as an operator
+  // would after replacing a failed disk.
+  void Wipe(raft::NodeId id) {
+    Stop(id);
+    (void)RemoveDirRecursive(DataDir(id));
+    StartServer(id, nodes_[id].port);
+    StartReplica(id, /*join=*/true);
   }
 
   [[nodiscard]] bool running(raft::NodeId id) const { return nodes_.at(id).replica != nullptr; }
@@ -178,13 +195,21 @@ class TestCluster {
     std::abort();
   }
 
-  void StartReplica(raft::NodeId id) {
+  std::string DataDir(raft::NodeId id) const {
+    return JoinPath(dir_.path(), "node" + std::to_string(id));
+  }
+
+  void StartReplica(raft::NodeId id, bool join = false) {
     Node& node = nodes_[id];
     server::ReplicaOptions o;
     o.id = id;
     o.peers = peers_;
-    o.data_dir = JoinPath(dir_.path(), "node" + std::to_string(id));
-    o.tick_ms = tick_ms_;
+    o.data_dir = DataDir(id);
+    o.tick_ms = options_.tick_ms;
+    o.snapshot_threshold = options_.snapshot_threshold;
+    o.snapshot_keep = options_.snapshot_keep;
+    o.read_through_log = options_.read_through_log;
+    o.join = join;
     o.db.sync = false;
     if (!server::Replica::Open(o, &node.replica).ok()) {
       std::abort();
@@ -194,7 +219,7 @@ class TestCluster {
     node.holder->replica = node.replica.get();
   }
 
-  int tick_ms_;
+  Options options_;
   TempDir dir_;
   std::map<raft::NodeId, std::string> peers_;
   std::map<raft::NodeId, Node> nodes_;

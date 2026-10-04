@@ -32,6 +32,33 @@ Status DecodePair(const std::string& data, uint64_t* a, uint64_t* b) {
   return Status::OK();
 }
 
+// HARDSTATE: fixed64 term | fixed64 vote | u8 flags | crc32c.
+std::string EncodeHardState(const HardState& hs) {
+  std::string out;
+  PutFixed64(&out, hs.term);
+  PutFixed64(&out, hs.vote);
+  out.push_back(static_cast<char>(hs.joining ? 1 : 0));
+  PutFixed32(&out, crc32c::Value(out));
+  return out;
+}
+
+Status ReadHardState(const std::string& path, HardState* hs) {
+  std::string data;
+  Status s = ReadFileToString(path, &data);
+  if (s.IsNotFound()) {
+    *hs = HardState{};
+    return Status::OK();
+  }
+  KV_RETURN_IF_ERROR(s);
+  if (data.size() != 21 || crc32c::Value(data.data(), 17) != DecodeFixed32(data.data() + 17)) {
+    return Status::Corruption(path + ": bad checksum");
+  }
+  hs->term = DecodeFixed64(data.data());
+  hs->vote = DecodeFixed64(data.data() + 8);
+  hs->joining = (data[16] & 1) != 0;
+  return Status::OK();
+}
+
 Status ReadPair(const std::string& path, uint64_t* a, uint64_t* b) {
   std::string data;
   Status s = ReadFileToString(path, &data);
@@ -59,7 +86,7 @@ Status FileLogStorage::Open(const std::string& dir, std::unique_ptr<FileLogStora
 }
 
 Status FileLogStorage::Load() {
-  KV_RETURN_IF_ERROR(ReadPair(JoinPath(dir_, kHardState), &hard_state_.term, &hard_state_.vote));
+  KV_RETURN_IF_ERROR(ReadHardState(JoinPath(dir_, kHardState), &hard_state_));
   KV_RETURN_IF_ERROR(ReadPair(JoinPath(dir_, kSnapshot), &snapshot_.index, &snapshot_.term));
 
   std::string contents;
@@ -104,7 +131,7 @@ Status FileLogStorage::SaveHardState(const HardState& hs) {
   if (hs == hard_state_) {
     return Status::OK();
   }
-  KV_RETURN_IF_ERROR(WriteFileAtomic(JoinPath(dir_, kHardState), EncodePair(hs.term, hs.vote)));
+  KV_RETURN_IF_ERROR(WriteFileAtomic(JoinPath(dir_, kHardState), EncodeHardState(hs)));
   hard_state_ = hs;
   return Status::OK();
 }

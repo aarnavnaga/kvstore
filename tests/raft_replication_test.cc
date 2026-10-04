@@ -206,17 +206,9 @@ TEST(RaftReplication, RandomizedFaultsConverge) {
     for (const NodeId id : c.ids()) {
       c.Restart(id);
     }
-    // One more write forces everything earlier to commit everywhere.
-    ASSERT_TRUE(ProposeWhenLeader(c, "final", 2000)) << "seed " << seed;
-    ASSERT_TRUE(c.RunUntil(
-        [&] {
-          if (!Converged(c)) {
-            return false;
-          }
-          const auto d = c.AppliedData(1);
-          return !d.empty() && d.back() == "final";
-        },
-        3000))
+    // One more committed write forces everything earlier to commit everywhere.
+    ASSERT_TRUE(c.CommitEventually("final", 5000)) << "seed " << seed << Describe(c);
+    ASSERT_TRUE(c.RunUntil([&] { return Converged(c); }, 1000))
         << "seed " << seed << ": nodes did not converge after healing" << Describe(c);
     ASSERT_TRUE(c.violation().empty()) << c.violation();
     total_applied += c.AppliedData(1).size();

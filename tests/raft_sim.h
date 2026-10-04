@@ -12,6 +12,8 @@
 //   Commit bound        no node's commit index passes the end of its own log
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <memory>
@@ -33,12 +35,23 @@ struct SimOptions {
   int max_delay = 3;
   double drop_rate = 0;
   double dup_rate = 0;
+  // Log compaction: once a node has applied compact_every entries past its last
+  // snapshot, it compacts its log, keeping compact_keep entries for slow followers.
+  // 0 disables compaction.
+  int compact_every = 0;
+  int compact_keep = 2;
   Config config;  // template; id, peers and seed are filled per node
 };
 
 class SimCluster {
  public:
   explicit SimCluster(SimOptions options) : options_(std::move(options)), rng_(options_.seed) {
+    if (const char* t = std::getenv("KV_SIM_TRACE_NODE")) {
+      trace_node_ = std::strtoull(t, nullptr, 10);
+    }
+    if (const char* t = std::getenv("KV_SIM_TRACE_FROM")) {
+      trace_from_ = std::strtoull(t, nullptr, 10);
+    }
     for (int i = 1; i <= options_.nodes; ++i) {
       ids_.push_back(static_cast<NodeId>(i));
     }
@@ -93,16 +106,64 @@ class SimCluster {
     }
   }
 
-  // WipeAndRestart loses the node's durable state as well (a replaced disk).
+  // WipeAndRestart loses the node's durable state as well (a replaced disk). It comes
+  // back in join mode, as an operator would restart it.
   void WipeAndRestart(NodeId id) {
     auto& n = nodes_[id];
     n.raft.reset();
     n.storage = std::make_unique<MemoryLogStorage>();
     n.applied.clear();
-    Start(id);
+    Start(id, /*join=*/true);
   }
 
   [[nodiscard]] bool alive(NodeId id) const { return nodes_.at(id).raft != nullptr; }
+
+  // AnyJoining reports whether a wiped node is still catching up, counting crashed ones
+  // through their durable joining flag.
+  [[nodiscard]] bool AnyJoining() const {
+    for (const auto& [id, n] : nodes_) {
+      if (n.raft ? !n.raft->joined() : n.storage->LoadHardState().joining) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // CommitEventually keeps proposing marker writes (as a client retries) until one of
+  // them is applied on every live node. A proposal can legitimately vanish if its
+  // leader loses leadership before replicating it; only committed writes are durable.
+  bool CommitEventually(const std::string& prefix, int max_ticks) {
+    int attempt = 0;
+    std::string marker;
+    for (int t = 0; t < max_ticks; ++t) {
+      if (t % 300 == 0) {
+        const std::string next = prefix + std::to_string(attempt);
+        if (Propose(next)) {
+          marker = next;
+          ++attempt;
+        }
+      }
+      bool everywhere = !marker.empty();
+      for (const NodeId id : ids_) {
+        if (!everywhere) {
+          break;
+        }
+        if (raft(id) == nullptr) {
+          continue;
+        }
+        const auto d = AppliedData(id);
+        everywhere = !d.empty() && d.back().rfind(prefix, 0) == 0;
+      }
+      if (everywhere) {
+        return true;
+      }
+      if (!violation_.empty()) {
+        return false;
+      }
+      Tick();
+    }
+    return false;
+  }
 
   // Partition splits the cluster: side and everyone else can no longer talk.
   void Partition(const std::set<NodeId>& side) {
@@ -132,6 +193,7 @@ class SimCluster {
   [[nodiscard]] const std::string& violation() const { return violation_; }
   [[nodiscard]] const std::vector<Entry>& applied(NodeId id) const { return nodes_.at(id).applied; }
   [[nodiscard]] size_t terms_with_leader() const { return leaders_by_term_.size(); }
+  [[nodiscard]] uint64_t snapshots_installed() const { return snapshots_installed_; }
 
   // StableLeader returns a leader that a quorum of nodes (itself included) currently
   // agree on, at the same term, or kNoNode.
@@ -173,6 +235,58 @@ class SimCluster {
     return true;
   }
 
+  // Dump summarizes every node, for failure messages.
+  std::string Dump() {
+    std::ostringstream os;
+    for (const NodeId id : ids_) {
+      os << "\n  node " << id << ": ";
+      if (RaftNode* r = raft(id)) {
+        os << RoleName(r->role()) << " term=" << r->term() << " leader=" << r->leader()
+           << " commit=" << r->commit_index() << " applied=" << r->applied_index()
+           << " last=" << r->last_index() << " snap=" << nodes_[id].storage->Snapshot().index
+           << " joined=" << r->joined() << " installed=" << r->snapshots_installed()
+           << " sent=" << r->snapshots_sent() << r->DebugString();
+      } else {
+        os << "down";
+      }
+      os << " sm_applied=" << nodes_[id].applied.size();
+    }
+    if (!violation_.empty()) {
+      os << "\n  violation: " << violation_;
+    }
+    return os.str();
+  }
+
+  // StartRead issues a ReadIndex on node id. It records the highest commit index any node
+  // has reached right now: a linearizable read must reflect at least that much.
+  bool StartRead(NodeId id, uint64_t ctx) {
+    RaftNode* r = raft(id);
+    if (r == nullptr || !r->ReadIndex(ctx).ok()) {
+      return false;
+    }
+    Index max_commit = 0;
+    for (const NodeId n : ids_) {
+      if (RaftNode* o = raft(n)) {
+        max_commit = std::max(max_commit, o->commit_index());
+      }
+    }
+    read_floor_[ctx] = max_commit;
+    Collect(id);
+    return true;
+  }
+
+  // TakeReads returns reads that completed (node, ctx, read index).
+  struct CompletedRead {
+    NodeId node;
+    uint64_t ctx;
+    Index index;
+  };
+  std::vector<CompletedRead> TakeReads() {
+    std::vector<CompletedRead> out;
+    out.swap(completed_reads_);
+    return out;
+  }
+
   // AppliedData returns the data of the normal entries node id has applied.
   std::vector<std::string> AppliedData(NodeId id) const {
     std::vector<std::string> out;
@@ -196,13 +310,45 @@ class SimCluster {
     Message m;
   };
 
-  void Start(NodeId id) {
+  void Start(NodeId id, bool join = false) {
     auto& n = nodes_[id];
     Config c = options_.config;
     c.id = id;
     c.peers = ids_;
     c.seed = options_.seed * 7919 + id + 1000 * restarts_++;
     c.applied = n.applied.empty() ? n.storage->Snapshot().index : n.applied.back().index;
+    c.join = join;
+    // The simulated state machine is the list of applied entries; its snapshot is that
+    // list, serialized.
+    c.snapshot_source = [this, id] {
+      const auto& applied = nodes_[id].applied;
+      auto snap = std::make_shared<Snapshot>();
+      if (applied.empty()) {
+        return std::shared_ptr<const Snapshot>();
+      }
+      snap->meta = {applied.back().index, applied.back().term};
+      for (const Entry& e : applied) {
+        snap->data += EncodeEntry(e);
+      }
+      return std::shared_ptr<const Snapshot>(std::move(snap));
+    };
+    c.snapshot_sink = [this, id](const Snapshot& snap) {
+      std::vector<Entry> entries;
+      std::string_view in = snap.data;
+      while (!in.empty()) {
+        Entry e;
+        if (!DecodeEntry(&in, &e)) {
+          return Status::Corruption("bad simulated snapshot");
+        }
+        entries.push_back(std::move(e));
+      }
+      for (const Entry& e : entries) {
+        CheckCommitted(id, e);  // a snapshot may only contain committed history
+      }
+      nodes_[id].applied = std::move(entries);
+      ++snapshots_installed_;
+      return Status::OK();
+    };
     n.raft = std::make_unique<RaftNode>(c, n.storage.get());
   }
 
@@ -218,6 +364,16 @@ class SimCluster {
            std::to_string(r->commit_index()) + " but its log ends at " +
            std::to_string(r->last_index()));
       return;
+    }
+    for (const auto& rs : r->TakeReadStates()) {
+      const auto it = read_floor_.find(rs.ctx);
+      if (it != read_floor_.end() && rs.index < it->second) {
+        Fail("stale read: ctx " + std::to_string(rs.ctx) + " on node " + std::to_string(id) +
+             " got read index " + std::to_string(rs.index) + " but index " +
+             std::to_string(it->second) + " was already committed when it was issued");
+        return;
+      }
+      completed_reads_.push_back({id, rs.ctx, rs.index});
     }
     ApplyCommitted(id);
     CheckLeader(id);
@@ -250,6 +406,19 @@ class SimCluster {
         continue;
       }
       if (RaftNode* r = raft(f.m.to)) {
+        if (trace_node_ != kNoNode && (f.m.to == trace_node_ || f.m.from == trace_node_) &&
+            now_ >= trace_from_) {
+          std::fprintf(
+              stderr,
+              "t=%llu %llu->%llu %s term=%llu snap=%llu off=%llu len=%zu done=%d ok=%d "
+              "match=%llu\n",
+              static_cast<unsigned long long>(now_), static_cast<unsigned long long>(f.m.from),
+              static_cast<unsigned long long>(f.m.to), MsgKindName(f.m.kind),
+              static_cast<unsigned long long>(f.m.term),
+              static_cast<unsigned long long>(f.m.snapshot.index),
+              static_cast<unsigned long long>(f.m.offset), f.m.data.size(), f.m.done ? 1 : 0,
+              f.m.success ? 1 : 0, static_cast<unsigned long long>(f.m.match_index));
+        }
         r->Step(f.m);
         Collect(f.m.to);
       }
@@ -269,15 +438,30 @@ class SimCluster {
              ", expected " + std::to_string(expected));
         return;
       }
-      const auto [it, inserted] = committed_.try_emplace(e.index, e.term, e.data);
-      if (!inserted && (it->second.first != e.term || it->second.second != e.data)) {
-        Fail("state machine safety: index " + std::to_string(e.index) + " applied as term " +
-             std::to_string(it->second.first) + " elsewhere but term " + std::to_string(e.term) +
-             " on node " + std::to_string(id));
+      if (!CheckCommitted(id, e)) {
         return;
       }
       n.applied.push_back(std::move(e));
     }
+    if (options_.compact_every > 0 && !n.applied.empty()) {
+      const Index applied = n.applied.back().index;
+      const Index snap = n.storage->Snapshot().index;
+      if (applied >= snap + static_cast<Index>(options_.compact_every) &&
+          applied > static_cast<Index>(options_.compact_keep)) {
+        (void)n.raft->Compact(applied - static_cast<Index>(options_.compact_keep));
+      }
+    }
+  }
+
+  bool CheckCommitted(NodeId id, const Entry& e) {
+    const auto [it, inserted] = committed_.try_emplace(e.index, e.term, e.data);
+    if (!inserted && (it->second.first != e.term || it->second.second != e.data)) {
+      Fail("state machine safety: index " + std::to_string(e.index) + " applied as term " +
+           std::to_string(it->second.first) + " elsewhere but term " + std::to_string(e.term) +
+           " on node " + std::to_string(id));
+      return false;
+    }
+    return true;
   }
 
   void CheckLeader(NodeId id) {
@@ -307,6 +491,11 @@ class SimCluster {
   std::vector<InFlight> in_flight_;
   uint64_t now_ = 0;
   uint64_t restarts_ = 0;
+  uint64_t snapshots_installed_ = 0;
+  NodeId trace_node_ = kNoNode;
+  uint64_t trace_from_ = 0;
+  std::map<uint64_t, Index> read_floor_;
+  std::vector<CompletedRead> completed_reads_;
   std::map<Term, NodeId> leaders_by_term_;
   std::map<Index, std::pair<Term, std::string>> committed_;
   std::string violation_;

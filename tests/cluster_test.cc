@@ -184,3 +184,89 @@ TEST(Cluster, FullRestartKeepsEverything) {
 
 }  // namespace
 }  // namespace kv
+
+namespace kv {
+namespace {
+
+using namespace std::chrono_literals;
+
+// SPEC M6 acceptance: a node wiped of its data rejoins and catches up from a snapshot.
+TEST(ClusterSnapshot, WipedNodeRejoinsFromSnapshot) {
+  test::TestCluster cluster(3, {.snapshot_threshold = 50, .snapshot_keep = 5});
+  const raft::NodeId leader = cluster.WaitForLeader();
+  ASSERT_NE(leader, raft::kNoNode);
+  client::KvClient c(ClientFor(cluster.addrs()));
+  std::map<std::string, std::string> want;
+  for (int i = 0; i < 500; ++i) {
+    want["k" + std::to_string(i)] = "v" + std::to_string(i);
+    ASSERT_TRUE(c.Put("k" + std::to_string(i), want["k" + std::to_string(i)]).ok());
+  }
+  ASSERT_TRUE(cluster.WaitForConvergence());
+  // The leader's log has been compacted far past the beginning.
+  EXPECT_GT(cluster.status(leader).snapshot_index, 400u);
+
+  const raft::NodeId victim = leader == 3 ? 2 : 3;
+  cluster.Wipe(victim);
+  EXPECT_FALSE(cluster.status(victim).joined);
+  ASSERT_TRUE(c.Put("after", "wipe").ok());
+  want["after"] = "wipe";
+  ASSERT_TRUE(cluster.WaitForConvergence());
+
+  const auto st = cluster.status(victim);
+  EXPECT_GE(st.snapshots_installed, 1u) << st.ToString();
+  EXPECT_TRUE(st.joined) << st.ToString();
+  for (const auto& [k, v] : want) {
+    std::string got;
+    ASSERT_TRUE(cluster.state_machine(victim)->Get(k, &got).ok()) << k;
+    ASSERT_EQ(got, v);
+  }
+}
+
+TEST(ClusterSnapshot, CompactionKeepsTheRaftLogBounded) {
+  test::TestCluster cluster(3, {.snapshot_threshold = 100, .snapshot_keep = 10});
+  ASSERT_NE(cluster.WaitForLeader(), raft::kNoNode);
+  client::KvClient c(ClientFor(cluster.addrs()));
+  for (int i = 0; i < 2000; ++i) {
+    ASSERT_TRUE(c.Put("k" + std::to_string(i % 50), std::to_string(i)).ok());
+  }
+  ASSERT_TRUE(cluster.WaitForConvergence());
+  for (const auto id : cluster.ids()) {
+    const auto st = cluster.status(id);
+    EXPECT_LE(st.last_index - st.snapshot_index, 110u) << st.ToString();
+  }
+  // And a full restart recovers from snapshot index + remaining log.
+  for (const auto id : cluster.ids()) {
+    cluster.Restart(id);
+  }
+  ASSERT_NE(cluster.WaitForLeader(), raft::kNoNode);
+  std::string v;
+  ASSERT_TRUE(c.Get("k49", &v).ok());
+  EXPECT_EQ(v, "1999");
+}
+
+TEST(ClusterReads, ReadIndexReadsAppendNothingToTheLog) {
+  test::TestCluster cluster(3);
+  const raft::NodeId leader = cluster.WaitForLeader();
+  ASSERT_NE(leader, raft::kNoNode);
+  client::KvClient c(ClientFor(cluster.addrs()));
+  ASSERT_TRUE(c.Put("k", "v").ok());
+  ASSERT_TRUE(cluster.WaitForConvergence());
+  const raft::Index before = cluster.status(leader).last_index;
+  for (int i = 0; i < 200; ++i) {
+    std::string v;
+    ASSERT_TRUE(c.Get("k", &v).ok());
+    ASSERT_EQ(v, "v");
+  }
+  EXPECT_EQ(cluster.status(leader).last_index, before) << "reads should not be log entries";
+
+  // Read-your-writes across many interleaved operations.
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_TRUE(c.Put("x", std::to_string(i)).ok());
+    std::string v;
+    ASSERT_TRUE(c.Get("x", &v).ok());
+    ASSERT_EQ(v, std::to_string(i));
+  }
+}
+
+}  // namespace
+}  // namespace kv

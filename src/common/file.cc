@@ -191,6 +191,13 @@ Status RemoveFile(const std::string& path) {
   return Status::OK();
 }
 
+Status RenamePath(const std::string& from, const std::string& to) {
+  if (::rename(from.c_str(), to.c_str()) != 0) {
+    return Status::IOErrorFromErrno("rename " + from + " -> " + to);
+  }
+  return Status::OK();
+}
+
 Status RemoveDirRecursive(const std::string& dir) {
   std::error_code ec;
   std::filesystem::remove_all(dir, ec);
