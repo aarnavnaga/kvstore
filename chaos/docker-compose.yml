@@ -1,0 +1,55 @@
+# Three-node cluster for fault injection. Fixed IPs let the harness cut specific links
+# with iptables; NET_ADMIN lets it shape traffic with tc netem inside each container.
+name: kvchaos
+
+x-node: &node
+  image: ${KV_IMAGE:-kvstore:dev}
+  cap_add: [NET_ADMIN]
+  restart: "no"
+
+x-env: &env
+  KV_PEERS: "1=node1:7000,2=node2:7000,3=node3:7000"
+  KV_DATA: /data
+  # 50 ms ticks: 750-1500 ms election timeouts, above the worst round trip the
+  # slow-network scenario injects (2 x 500 ms).
+  KV_TICK_MS: "50"
+  # Snapshot often so the data-wipe scenario exercises InstallSnapshot.
+  KV_EXTRA_ARGS: "--snapshot_threshold=500 --snapshot_keep=50"
+
+services:
+  node1:
+    <<: *node
+    hostname: node1
+    environment: { <<: *env, KV_ID: "1" }
+    volumes: [node1:/data]
+    networks: { kv: { ipv4_address: 172.28.0.11 } }
+  node2:
+    <<: *node
+    hostname: node2
+    environment: { <<: *env, KV_ID: "2" }
+    volumes: [node2:/data]
+    networks: { kv: { ipv4_address: 172.28.0.12 } }
+  node3:
+    <<: *node
+    hostname: node3
+    environment: { <<: *env, KV_ID: "3" }
+    volumes: [node3:/data]
+    networks: { kv: { ipv4_address: 172.28.0.13 } }
+
+  # Client-side tools, run on demand: the history recorder and the CLI.
+  recorder:
+    image: ${KV_IMAGE:-kvstore:dev}
+    profiles: [tools]
+    entrypoint: ["kvhistory"]
+    volumes: [./out:/out]
+    networks: [kv]
+
+networks:
+  kv:
+    ipam:
+      config: [{ subnet: 172.28.0.0/24 }]
+
+volumes:
+  node1: {}
+  node2: {}
+  node3: {}

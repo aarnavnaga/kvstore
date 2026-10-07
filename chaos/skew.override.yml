@@ -1,0 +1,6 @@
+# Clock-skew scenario: node3's clock (wall and monotonic) runs at 2x via libfaketime, so
+# its election timer fires twice as fast as everyone else's.
+services:
+  node3:
+    environment:
+      KV_CLOCK_RATE: "2"

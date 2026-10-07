@@ -82,6 +82,9 @@ Status KvClient::Execute(net::KvRequest req, net::KvResponse* resp) {
     return Status::InvalidArgument("no servers configured");
   }
   std::lock_guard lk(mu_);
+  if (!options_.sticky_leader) {
+    leader_.clear();
+  }
   if (req.op != net::MsgType::kGet) {
     // One sequence number per logical write, reused by every retry: that is what lets
     // the state machine recognize a duplicate.

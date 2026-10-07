@@ -1,0 +1,8 @@
+build/
+.git/
+fuzz/corpus-*/
+chaos/out/
+bench/results/raw/
+client-java/target/
+*.swp
+.DS_Store

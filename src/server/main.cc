@@ -99,6 +99,7 @@ int main(int argc, char** argv) {
   options.read_through_log = flags.Get("reads", "readindex") == "log";
   // --join: this node's disk was wiped; rejoin as a non-voter until caught up.
   options.join = flags.GetBool("join", false);
+  options.unsafe_local_reads = flags.GetBool("unsafe_local_reads", false);
   std::unique_ptr<kv::server::Replica> replica;
   const kv::Status s = kv::server::Replica::Open(options, &replica);
   if (!s.ok()) {

@@ -13,3 +13,4 @@ timeout-*
 /client-java/target/
 /deploy/certs/
 __pycache__/
+/chaos/bin/

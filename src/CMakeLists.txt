@@ -52,3 +52,6 @@ target_link_libraries(kvserver PRIVATE kv_server_lib)
 
 add_executable(kvcli tools/kvcli.cc)
 target_link_libraries(kvcli PRIVATE kv_client)
+
+add_executable(kvhistory tools/kvhistory.cc)
+target_link_libraries(kvhistory PRIVATE kv_client)
