@@ -102,12 +102,10 @@ jobs:
       - name: Build the production image
         run: docker build -t kvstore:ci -f deploy/docker/Dockerfile .
       - name: Trivy (fail on critical CVEs)
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: kvstore:ci
-          scanners: vuln
-          severity: CRITICAL
-          exit-code: "1"
+        # The same scanner image and flags as `make scan`, so CI and local runs agree.
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.56.2 \
+            image --quiet --scanners vuln --severity CRITICAL --exit-code 1 kvstore:ci
       - name: Helm chart renders
         run: |
           curl -fsSL https://get.helm.sh/helm-v3.16.1-linux-amd64.tar.gz | tar -xz -C /tmp
