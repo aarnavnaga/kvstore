@@ -1,0 +1,6 @@
+apiVersion: v2
+name: kvstore
+description: A Raft-replicated key-value store with mutual TLS between nodes
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

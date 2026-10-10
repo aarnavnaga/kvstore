@@ -23,6 +23,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd --system --uid 10001 --home /var/lib/kvstore kvstore
 COPY --from=build /build/src/kvserver /build/src/kvcli /build/src/kvhistory /usr/local/bin/
 COPY deploy/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-EXPOSE 7000
+EXPOSE 7000 9100
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
 CMD ["kvserver"]

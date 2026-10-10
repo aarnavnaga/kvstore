@@ -76,7 +76,7 @@ void Replica::Wake() {
 }
 
 void Replica::Start() {
-  transport_ = std::make_unique<PeerTransport>(options_.id, options_.peers);
+  transport_ = std::make_unique<PeerTransport>(options_.id, options_.peers, options_.tls);
   thread_ = std::thread([this] { Run(); });
 }
 
@@ -250,6 +250,8 @@ void Replica::ProposeBatch(std::vector<Proposal> batch) {
     for (size_t i = start; i < end; ++i) {
       pending_[first + (i - start)] = Pending{term, std::move(batch[i].respond), batch[i].deadline};
     }
+    proposals_ += end - start;
+    ++proposal_batches_;
   }
 }
 
@@ -447,6 +449,18 @@ void Replica::PublishStatus() {
   s.snapshots_sent = raft_->snapshots_sent();
   s.joined = raft_->joined();
   s.ticks = ticks_;
+  if (raft_->leader() != last_leader_) {
+    if (raft_->leader() != raft::kNoNode) {
+      ++leader_changes_;
+    }
+    last_leader_ = raft_->leader();
+  }
+  s.leader_changes = leader_changes_;
+  s.proposals = proposals_;
+  s.proposal_batches = proposal_batches_;
+  s.log_appends = log_->appends();
+  s.log_sync_seconds = static_cast<double>(log_->sync_nanos()) / 1e9;
+  s.peer_messages_dropped = transport_ ? transport_->dropped() : 0;
   std::lock_guard lk(status_mu_);
   status_ = s;
 }

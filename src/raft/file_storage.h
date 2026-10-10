@@ -37,6 +37,8 @@ class FileLogStorage final : public LogStorage {
   Status ResetToSnapshot(const SnapshotMeta& meta) override;
 
   [[nodiscard]] uint64_t log_file_bytes() const { return log_ ? log_->size() : 0; }
+  [[nodiscard]] uint64_t appends() const { return appends_; }
+  [[nodiscard]] uint64_t sync_nanos() const { return sync_nanos_; }
 
  private:
   explicit FileLogStorage(std::string dir) : dir_(std::move(dir)) {}
@@ -51,6 +53,8 @@ class FileLogStorage final : public LogStorage {
   SnapshotMeta snapshot_;
   std::vector<Entry> entries_;  // entries_[0] has index snapshot_.index + 1
   std::unique_ptr<AppendFile> log_;
+  uint64_t appends_ = 0;     // fsynced appends
+  uint64_t sync_nanos_ = 0;  // time spent in those fsyncs
 };
 
 }  // namespace kv::raft

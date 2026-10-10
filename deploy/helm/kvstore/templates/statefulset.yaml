@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "kvstore.fullname" . }}
+  labels: {{- include "kvstore.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "kvstore.headless" . }}
+  replicas: {{ .Values.replicas }}
+  # Start every pod at once. The default OrderedReady would wait for pod 0 to be Ready
+  # before creating pod 1, but pod 0 cannot be Ready (no leader) until a majority runs.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {{- include "kvstore.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "kvstore.selector" . | nindent 8 }}
+    spec:
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      affinity:
+        # One replica per Kubernetes node where possible, so a node failure costs one vote.
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {{- include "kvstore.selector" . | nindent 20 }}
+      containers:
+        - name: kvserver
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["kvserver"]
+          env:
+            - { name: KV_ID_FROM_HOSTNAME, value: "1" }
+            - { name: KV_PEERS, value: {{ include "kvstore.peers" . | quote }} }
+            - { name: KV_DATA, value: /var/lib/kvstore }
+            - { name: KV_TICK_MS, value: {{ .Values.tickMs | quote }} }
+            - { name: KV_EXTRA_ARGS, value: "--snapshot_threshold={{ .Values.snapshotThreshold }}" }
+            {{- if .Values.tls.enabled }}
+            - { name: KV_TLS_DIR, value: /etc/kvstore/tls }
+            {{- end }}
+          ports:
+            - { name: kv, containerPort: 7000 }
+            - { name: admin, containerPort: 9100 }
+          readinessProbe:
+            # Ready once this node knows a leader and is not rejoining after a wipe.
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/kvstore }
+            {{- if .Values.tls.enabled }}
+            - { name: tls, mountPath: /etc/kvstore/tls, readOnly: true }
+            {{- end }}
+      volumes:
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ include "kvstore.fullname" . }}-tls
+            defaultMode: 0440
+        {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+---
+# Voluntary disruptions (node drains, upgrades) take down at most one replica at a time,
+# so a rolling operation never costs the cluster its quorum.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "kvstore.fullname" . }}
+  labels: {{- include "kvstore.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: {{- include "kvstore.selector" . | nindent 6 }}

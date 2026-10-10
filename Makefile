@@ -42,3 +42,29 @@ shell:
 
 clean:
 	rm -rf build
+
+# ---- images, chaos, Kubernetes ----------------------------------------------------------
+
+.PHONY: image scan chaos chaos-matrix k8s-e2e k8s-down
+
+image:
+	$(DOCKER) build -t kvstore:dev -f deploy/docker/Dockerfile .
+
+# Fails on any critical CVE in the production image.
+scan: image
+	$(DOCKER) run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.56.2 \
+	  image --quiet --scanners vuln --severity CRITICAL --exit-code 1 kvstore:dev
+
+# One fault-injection scenario: make chaos SCENARIO=leader-crash SEED=1
+chaos: image
+	chaos/run.sh $(SCENARIO) $(or $(SEED),1)
+
+# Every scenario x 20 seeds (about two hours).
+chaos-matrix: image
+	chaos/matrix.sh 1 20
+
+k8s-e2e: image
+	deploy/k8s/e2e.sh
+
+k8s-down:
+	deploy/k8s/e2e.sh down

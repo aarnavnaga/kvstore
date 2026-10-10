@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 
+#include "net/tls.h"
 #include "raft/types.h"
 
 namespace kv::server {
@@ -22,7 +23,8 @@ namespace kv::server {
 // retransmits whatever the follower is missing.
 class PeerTransport {
  public:
-  PeerTransport(raft::NodeId self, const std::map<raft::NodeId, std::string>& peers);
+  PeerTransport(raft::NodeId self, const std::map<raft::NodeId, std::string>& peers,
+                std::shared_ptr<net::TlsContext> tls = nullptr);
   ~PeerTransport();
 
   PeerTransport(const PeerTransport&) = delete;
@@ -47,6 +49,7 @@ class PeerTransport {
 
   static constexpr size_t kMaxQueue = 4096;
 
+  std::shared_ptr<net::TlsContext> tls_;
   std::map<raft::NodeId, std::unique_ptr<Peer>> peers_;
   std::atomic<bool> stopping_{false};
 };

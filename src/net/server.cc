@@ -5,6 +5,8 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
 #include <poll.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -16,6 +18,8 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+
+#include "net/client.h"
 
 namespace kv::net {
 
@@ -39,12 +43,18 @@ bool ParseHostPort(std::string_view addr, std::string* host, uint16_t* port) {
 
 struct Server::Conn {
   Conn(int fd, uint32_t max_frame) : fd(fd), decoder(max_frame) {}
+  ~Conn() { SSL_free(ssl); }
+  Conn(const Conn&) = delete;
+  Conn& operator=(const Conn&) = delete;
+
   const int fd;
   FrameDecoder decoder;
   std::string out;
   size_t out_pos = 0;
   bool closed = false;      // loop thread only
   bool want_write = false;  // EPOLLOUT registered
+  SSL* ssl = nullptr;       // set when the server runs TLS
+  bool handshaking = false;
 };
 
 class Server::Loop : public std::enable_shared_from_this<Server::Loop> {
@@ -116,6 +126,10 @@ class Server::Loop : public std::enable_shared_from_this<Server::Loop> {
       return;
     }
     auto conn = std::make_shared<Conn>(fd, server_->options_.max_frame_size);
+    if (server_->options_.tls) {
+      conn->ssl = server_->options_.tls->NewServer(fd);
+      conn->handshaking = true;
+    }
     epoll_event ev{};
     ev.events = EPOLLIN | EPOLLRDHUP;
     ev.data.fd = fd;
@@ -142,6 +156,9 @@ class Server::Loop : public std::enable_shared_from_this<Server::Loop> {
   }
 
  private:
+  // IoResult is what one read or write attempt on a (plain or TLS) socket came to.
+  enum class Io { kProgress, kWantRead, kWantWrite, kClosed };
+
   void Wake() {
     const uint64_t one = 1;
     // A full eventfd counter still means "wake up", so a failed write is fine.
@@ -168,7 +185,9 @@ class Server::Loop : public std::enable_shared_from_this<Server::Loop> {
         if ((e & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0) {
           Read(conn);
         }
-        if ((e & EPOLLOUT) != 0 && !conn->closed) {
+        // TLS may need to write to make progress on a read (and vice versa), so a
+        // writable socket also retries any pending output, including the handshake.
+        if (!conn->closed && ((e & EPOLLOUT) != 0 || conn->out_pos < conn->out.size())) {
           Flush(conn);
         }
       }
@@ -187,29 +206,120 @@ class Server::Loop : public std::enable_shared_from_this<Server::Loop> {
     }
   }
 
-  void Read(const std::shared_ptr<Conn>& conn) {
-    char buf[64 * 1024];
-    while (true) {
-      const ssize_t n = ::recv(conn->fd, buf, sizeof(buf), 0);
-      if (n > 0) {
-        conn->decoder.Feed(std::string_view(buf, static_cast<size_t>(n)));
-        continue;
-      }
-      if (n == 0) {
-        DrainFrames(conn);
+  // Handshake drives a TLS handshake forward. Returns true once it has completed.
+  bool Handshake(const std::shared_ptr<Conn>& conn) {
+    const int rc = SSL_do_handshake(conn->ssl);
+    if (rc == 1) {
+      conn->handshaking = false;
+      SetWantWrite(conn, conn->out_pos < conn->out.size());
+      return true;
+    }
+    switch (SSL_get_error(conn->ssl, rc)) {
+      case SSL_ERROR_WANT_READ:
+        SetWantWrite(conn, false);
+        return false;
+      case SSL_ERROR_WANT_WRITE:
+        SetWantWrite(conn, true);
+        return false;
+      default:
+        // No certificate, a certificate from another CA, or not TLS at all.
+        server_->tls_failures_.fetch_add(1, std::memory_order_relaxed);
+        ERR_clear_error();
         Close(conn);
-        return;
+        return false;
+    }
+  }
+
+  Io ReadSome(const std::shared_ptr<Conn>& conn, char* buf, size_t len, size_t* got) {
+    if (conn->ssl == nullptr) {
+      while (true) {
+        const ssize_t n = ::recv(conn->fd, buf, len, 0);
+        if (n > 0) {
+          *got = static_cast<size_t>(n);
+          return Io::kProgress;
+        }
+        if (n < 0 && errno == EINTR) {
+          continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+          return Io::kWantRead;
+        }
+        return Io::kClosed;
       }
-      if (errno == EINTR) {
-        continue;
+    }
+    const int n = SSL_read(conn->ssl, buf, static_cast<int>(len));
+    if (n > 0) {
+      *got = static_cast<size_t>(n);
+      return Io::kProgress;
+    }
+    switch (SSL_get_error(conn->ssl, n)) {
+      case SSL_ERROR_WANT_READ:
+        return Io::kWantRead;
+      case SSL_ERROR_WANT_WRITE:
+        return Io::kWantWrite;
+      default:
+        ERR_clear_error();
+        return Io::kClosed;
+    }
+  }
+
+  Io WriteSome(const std::shared_ptr<Conn>& conn, const char* data, size_t len, size_t* put) {
+    if (conn->ssl == nullptr) {
+      while (true) {
+        const ssize_t n = ::send(conn->fd, data, len, MSG_NOSIGNAL);
+        if (n > 0) {
+          *put = static_cast<size_t>(n);
+          return Io::kProgress;
+        }
+        if (n < 0 && errno == EINTR) {
+          continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+          return Io::kWantWrite;
+        }
+        return Io::kClosed;
       }
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        break;
-      }
-      Close(conn);
+    }
+    const int n = SSL_write(conn->ssl, data, static_cast<int>(std::min<size_t>(len, 1u << 30)));
+    if (n > 0) {
+      *put = static_cast<size_t>(n);
+      return Io::kProgress;
+    }
+    switch (SSL_get_error(conn->ssl, n)) {
+      case SSL_ERROR_WANT_READ:
+        return Io::kWantRead;
+      case SSL_ERROR_WANT_WRITE:
+        return Io::kWantWrite;
+      default:
+        ERR_clear_error();
+        return Io::kClosed;
+    }
+  }
+
+  void Read(const std::shared_ptr<Conn>& conn) {
+    if (conn->handshaking && !Handshake(conn)) {
       return;
     }
-    DrainFrames(conn);
+    char buf[64 * 1024];
+    while (true) {
+      size_t got = 0;
+      switch (ReadSome(conn, buf, sizeof(buf), &got)) {
+        case Io::kProgress:
+          conn->decoder.Feed(std::string_view(buf, got));
+          continue;
+        case Io::kWantRead:
+          DrainFrames(conn);
+          return;
+        case Io::kWantWrite:
+          SetWantWrite(conn, true);  // TLS needs to send before it can read more
+          DrainFrames(conn);
+          return;
+        case Io::kClosed:
+          DrainFrames(conn);
+          Close(conn);
+          return;
+      }
+    }
   }
 
   void DrainFrames(const std::shared_ptr<Conn>& conn) {
@@ -232,22 +342,33 @@ class Server::Loop : public std::enable_shared_from_this<Server::Loop> {
   }
 
   void Flush(const std::shared_ptr<Conn>& conn) {
-    while (conn->out_pos < conn->out.size()) {
-      const ssize_t n = ::send(conn->fd, conn->out.data() + conn->out_pos,
-                               conn->out.size() - conn->out_pos, MSG_NOSIGNAL);
-      if (n > 0) {
-        conn->out_pos += static_cast<size_t>(n);
-        continue;
+    if (conn->handshaking) {
+      if (!Handshake(conn)) {
+        return;  // output, if any, is flushed once the handshake completes
       }
-      if (n < 0 && errno == EINTR) {
-        continue;
-      }
-      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        SetWantWrite(conn, true);
+      // The client's first request may already sit decrypted in OpenSSL's buffer, and
+      // a level-triggered epoll will not report the socket readable for it again.
+      Read(conn);
+      if (conn->closed) {
         return;
       }
-      Close(conn);
-      return;
+    }
+    while (conn->out_pos < conn->out.size()) {
+      size_t put = 0;
+      switch (WriteSome(conn, conn->out.data() + conn->out_pos, conn->out.size() - conn->out_pos,
+                        &put)) {
+        case Io::kProgress:
+          conn->out_pos += put;
+          continue;
+        case Io::kWantWrite:
+          SetWantWrite(conn, true);
+          return;
+        case Io::kWantRead:
+          return;  // TLS must read first; the next readable event retries the flush
+        case Io::kClosed:
+          Close(conn);
+          return;
+      }
     }
     conn->out.clear();
     conn->out_pos = 0;
@@ -255,7 +376,7 @@ class Server::Loop : public std::enable_shared_from_this<Server::Loop> {
   }
 
   void SetWantWrite(const std::shared_ptr<Conn>& conn, bool want) {
-    if (conn->want_write == want) {
+    if (conn->want_write == want || conn->closed) {
       return;
     }
     epoll_event ev{};
@@ -396,6 +517,8 @@ void Server::AcceptLoop() {
       const int one = 1;
       // Requests and responses are small and latency-bound; never wait to coalesce.
       ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+      // Reap connections from peers that vanished without closing (a deleted pod).
+      EnableKeepalive(fd, 10);
       open_.fetch_add(1);
       accepted_.fetch_add(1);
       const auto& loop = loops_[next_loop_.fetch_add(1) % loops_.size()];
@@ -435,6 +558,7 @@ ServerStats Server::stats() const {
   s.frames_in = frames_in_.load();
   s.frames_out = frames_out_.load();
   s.protocol_errors = protocol_errors_.load();
+  s.tls_failures = tls_failures_.load();
   return s;
 }
 

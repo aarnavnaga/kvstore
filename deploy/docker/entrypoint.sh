@@ -7,12 +7,24 @@
 #                           wiping the disk: start with --join, once. The node persists
 #                           its joining state itself from then on.
 #   KV_CLOCK_RATE=2         run under libfaketime with the clock at 2x speed.
+#   KV_ID_FROM_HOSTNAME=1   derive KV_ID from a StatefulSet pod name: kvstore-0 is node 1.
+#   KV_TLS_DIR              directory with ca.crt, tls.crt and tls.key: enables mutual TLS.
 set -eu
 
 if [ "${1:-}" != "kvserver" ]; then
   exec "$@"
 fi
 shift
+
+if [ -z "${KV_ID:-}" ] && [ "${KV_ID_FROM_HOSTNAME:-}" = "1" ]; then
+  ORDINAL="${HOSTNAME##*-}"
+  KV_ID=$((ORDINAL + 1))
+fi
+
+TLS=""
+if [ -n "${KV_TLS_DIR:-}" ]; then
+  TLS="--tls_ca=$KV_TLS_DIR/ca.crt --tls_cert=$KV_TLS_DIR/tls.crt --tls_key=$KV_TLS_DIR/tls.key"
+fi
 
 DATA="${KV_DATA:-/var/lib/kvstore}"
 mkdir -p "$DATA"
@@ -38,4 +50,5 @@ exec kvserver \
   --listen="${KV_LISTEN:-0.0.0.0:7000}" \
   --data="$DATA" \
   --tick_ms="${KV_TICK_MS:-10}" \
-  $EXTRA ${KV_EXTRA_ARGS:-} "$@"
+  --admin_listen="${KV_ADMIN_LISTEN:-0.0.0.0:9100}" \
+  $TLS $EXTRA ${KV_EXTRA_ARGS:-} "$@"

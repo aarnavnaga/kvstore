@@ -7,10 +7,14 @@
 
 #include "common/status.h"
 #include "net/frame.h"
+#include "net/tls.h"
 
 namespace kv::net {
 
 using Millis = std::chrono::milliseconds;
+
+// EnableKeepalive turns on aggressive TCP keepalives for a socket.
+void EnableKeepalive(int fd, int idle_seconds);
 
 // Connection is a blocking client connection with deadlines on every operation. It is
 // not thread-safe; callers use one per thread or guard it.
@@ -18,7 +22,9 @@ class Connection {
  public:
   // Dial connects to "host:port", resolving host with DNS (so Docker and Kubernetes
   // service names work).
-  static Status Dial(const std::string& addr, Millis timeout, std::unique_ptr<Connection>* out);
+  // With tls set, the connection completes a mutual-TLS handshake before returning.
+  static Status Dial(const std::string& addr, Millis timeout, std::unique_ptr<Connection>* out,
+                     const std::shared_ptr<TlsContext>& tls = nullptr);
   ~Connection();
 
   Connection(const Connection&) = delete;
@@ -37,8 +43,10 @@ class Connection {
 
  private:
   Connection(int fd, std::string addr) : fd_(fd), addr_(std::move(addr)) {}
+  Status Handshake(std::chrono::steady_clock::time_point deadline);
 
   int fd_;
+  SSL* ssl_ = nullptr;
   std::string addr_;
   FrameDecoder decoder_;
   uint64_t next_id_ = 1;

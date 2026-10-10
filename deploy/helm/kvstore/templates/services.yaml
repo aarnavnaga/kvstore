@@ -1,0 +1,28 @@
+# Headless service: gives every pod a stable DNS name for Raft peer traffic.
+#
+# publishNotReadyAddresses matters: a pod only becomes Ready once a leader exists, and a
+# leader needs peers to reach each other first. Publishing only ready pods would leave
+# a fresh cluster unable to find itself.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kvstore.headless" . }}
+  labels: {{- include "kvstore.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {{- include "kvstore.selector" . | nindent 4 }}
+  ports:
+    - { name: kv, port: 7000 }
+    - { name: admin, port: 9100 }
+---
+# Client service: any ready node. Followers redirect writes and reads to the leader.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kvstore.fullname" . }}
+  labels: {{- include "kvstore.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "kvstore.selector" . | nindent 4 }}
+  ports:
+    - { name: kv, port: 7000 }

@@ -17,6 +17,7 @@ namespace {
 int Usage() {
   std::fprintf(stderr,
                "usage: kvcli [--servers=host:port,...] [--timeout_ms=N] "
+               "[--tls_ca=F --tls_cert=F --tls_key=F] "
                "put <key> <value> | get <key> | del <key> | ping | status\n");
   return 2;
 }
@@ -37,6 +38,11 @@ int main(int argc, char** argv) {
   kv::client::ClientOptions options;
   options.servers = kv::SplitList(flags.Get("servers", "127.0.0.1:7000"));
   options.operation_timeout = kv::net::Millis(flags.GetInt("timeout_ms", 10000));
+  if (const kv::Status s = kv::net::TlsFromFiles(flags.Get("tls_ca"), flags.Get("tls_cert"),
+                                                 flags.Get("tls_key"), &options.tls);
+      !s.ok()) {
+    return Fail(s);
+  }
   kv::client::KvClient client(options);
 
   const std::string& cmd = args[0];

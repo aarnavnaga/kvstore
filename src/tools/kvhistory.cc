@@ -65,6 +65,13 @@ int main(int argc, char** argv) {
   const std::string out_path = flags.Get("out", "history.jsonl");
   const auto op_timeout = std::chrono::milliseconds(flags.GetInt("op_timeout_ms", 5000));
   const bool read_any = flags.GetBool("read_any", false);
+  std::shared_ptr<kv::net::TlsContext> tls;
+  if (const kv::Status s = kv::net::TlsFromFiles(flags.Get("tls_ca"), flags.Get("tls_cert"),
+                                                 flags.Get("tls_key"), &tls);
+      !s.ok()) {
+    std::fprintf(stderr, "tls: %s\n", s.ToString().c_str());
+    return 2;
+  }
 
   std::ofstream out(out_path, std::ios::trunc);
   if (!out) {
@@ -86,6 +93,7 @@ int main(int argc, char** argv) {
       opts.servers = servers;
       opts.request_timeout = std::chrono::milliseconds(2000);
       opts.operation_timeout = op_timeout;
+      opts.tls = tls;
       kv::client::KvClient client(opts);
       // One client pinned to each node, for --read_any. They start at their own node;
       // a correct server redirects them from there.

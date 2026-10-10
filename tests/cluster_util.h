@@ -27,6 +27,7 @@ class TestCluster {
     uint64_t snapshot_threshold = 10000;
     uint64_t snapshot_keep = 1000;
     bool read_through_log = false;
+    std::shared_ptr<net::TlsContext> tls;  // mutual TLS on every connection
   };
 
   explicit TestCluster(int n) : TestCluster(n, Options{}) {}
@@ -170,6 +171,7 @@ class TestCluster {
     opts.port = port;
     opts.io_threads = 1;
     opts.worker_threads = 2;
+    opts.tls = options_.tls;
     node.server =
         std::make_unique<net::Server>(opts, [holder](const net::Frame& f, const net::Responder& r) {
           std::lock_guard lk(holder->mu);
@@ -211,6 +213,7 @@ class TestCluster {
     o.read_through_log = options_.read_through_log;
     o.join = join;
     o.db.sync = false;
+    o.tls = options_.tls;
     if (!server::Replica::Open(o, &node.replica).ok()) {
       std::abort();
     }

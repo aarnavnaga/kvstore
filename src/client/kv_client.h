@@ -26,6 +26,8 @@ struct ClientOptions {
   // sticky_leader remembers the leader between operations. Off, every operation starts
   // at the configured servers again (it still follows redirects within the operation).
   bool sticky_leader = true;
+  // Mutual TLS for clusters that require it.
+  std::shared_ptr<net::TlsContext> tls;
 };
 
 // KvClient talks to a cluster: it follows NotLeader redirects, retries on connection

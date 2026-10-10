@@ -139,7 +139,7 @@ Status KvClient::CallNode(const std::string& addr, net::MsgType type, std::strin
   auto it = conns_.find(addr);
   if (it == conns_.end()) {
     std::unique_ptr<net::Connection> conn;
-    KV_RETURN_IF_ERROR(net::Connection::Dial(addr, options_.request_timeout, &conn));
+    KV_RETURN_IF_ERROR(net::Connection::Dial(addr, options_.request_timeout, &conn, options_.tls));
     it = conns_.emplace(addr, std::move(conn)).first;
   }
   Status s = it->second->Call(type, std::move(payload), response, options_.request_timeout);
