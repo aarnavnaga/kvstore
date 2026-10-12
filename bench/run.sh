@@ -126,29 +126,25 @@ done
 "${C[@]}" down -v >/dev/null 2>&1
 
 # ---- recovery time with ~1 GB of data ----------------------------------------------------
-P=kvbenchrecover
-docker rm -f "$P" >/dev/null 2>&1 || true
-docker network create "$P" >/dev/null 2>&1 || true
-docker volume rm "$P" >/dev/null 2>&1 || true
-start_single() {
-  docker run -d --name "$P" --hostname node1 --network "$P" -v "$P:/data" \
-    -e KV_ID=1 -e KV_PEERS=1=node1:7000 -e KV_DATA=/data kvstore:dev kvserver >/dev/null
-}
-start_single
-sleep 1
-say "recovery: loading $KEYS keys into one node"
-kvbench "$P" --mode=load --servers=node1:7000 --keys="$KEYS" --connections=8 --depth=64 >/dev/null
-DATA_MB=$(docker exec "$P" du -sm /data | cut -f1)
-for i in 1 2 3 4 5; do
-  docker kill -s KILL "$P" >/dev/null
-  docker rm "$P" >/dev/null
-  start_single
-  ready=$(kvbench "$P" --mode=wait --servers=node1:7000)
-  echo "$ready" | sed -E "s/\\}\$/,\"data_mb\":$DATA_MB}/" >> "$RAW/recovery.jsonl"
-done
-docker rm -f "$P" >/dev/null
-docker volume rm "$P" >/dev/null
-docker network rm "$P" >/dev/null
+# The node and the probe share one container, so the clock starts the moment the server
+# process is spawned (a separate probe container would start its timer late).
+say "recovery: loading $KEYS keys into one node, then kill -9 and restart 5 times"
+docker volume rm kvbench-recover >/dev/null 2>&1 || true
+docker run --rm -v kvbench-recover:/data -v "$ROOT:/src" -e KEYS="$KEYS" kvstore-dev bash -c '
+  B=/src/build/release
+  start() { $B/src/kvserver --id=1 --peers=1=127.0.0.1:7000 --listen=127.0.0.1:7000 \
+              --admin_listen= --data=/data 2>/dev/null & P=$!; }
+  start
+  $B/bench/kvbench --mode=wait --servers=127.0.0.1:7000 >/dev/null
+  $B/bench/kvbench --mode=load --servers=127.0.0.1:7000 --keys=$KEYS --connections=8 --depth=64 >/dev/null
+  MB=$(du -sm /data | cut -f1)
+  for i in 1 2 3 4 5; do
+    kill -9 $P; wait $P 2>/dev/null
+    start
+    $B/bench/kvbench --mode=wait --servers=127.0.0.1:7000 | sed -E "s/\}\$/,\"data_mb\":$MB}/"
+  done
+  kill -9 $P' > "$RAW/recovery.jsonl"
+docker volume rm kvbench-recover >/dev/null
 
 # ---- correctness -----------------------------------------------------------------------------
 if [ -f "$ROOT/chaos/out/results.csv" ]; then

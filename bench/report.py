@@ -51,10 +51,11 @@ for k in ["date", "commit", "host_cpu", "host_cores", "host_memory_gb", "docker_
         out.append(f"| {k.replace('_', ' ')} | {envd[k].strip()} |")
 out += ["",
         "All nodes and the load generator share one laptop through Docker Desktop's Linux VM,",
-        "so absolute numbers are a lower bound for real hardware with one node per machine;",
-        "the comparisons between configurations are the meaningful part. `fsync` on Docker",
-        "Desktop's virtual disk is also much cheaper than on a datacenter SSD with power-loss",
-        "protection turned off, and much more expensive than one with it on.", ""]
+        "competing for the same 8 cores, so absolute numbers are a lower bound for real",
+        "hardware with one node per machine, and runs vary by tens of percent. Comparisons",
+        "within one run (group commit on/off, ReadIndex vs. log reads) are the meaningful",
+        "part. Whether `fsync` inside Docker Desktop's VM reaches the Mac's physical disk was",
+        "not verified, so write numbers say more about the code path than about the drive.", ""]
 
 # ---- storage engine ------------------------------------------------------------------
 storage = {r["bench"]: r for r in jsonl("storage.jsonl")}
@@ -113,7 +114,13 @@ if sat:
     ax.legend(frameon=False)
     fig.tight_layout()
     fig.savefig(ROOT / "throughput.png")
-    out += ["", "![throughput](throughput.png)", ""]
+    out += ["",
+            "Five nodes should be slower than three for anything that touches a quorum, and for",
+            "writes they are: every entry is sent to and acknowledged by more followers, on the",
+            "same 8 cores. The read-heavy results (B above all) do not follow that pattern",
+            "reliably; on a shared machine the 3- vs. 5-node read comparison is within run-to-run",
+            "noise and should not be read as 5 nodes being faster.",
+            "", "![throughput](throughput.png)", ""]
 
 if lat:
     out += ["## Latency", "",
@@ -171,8 +178,9 @@ if rec:
     times = sorted(r["ready_ms"] for r in rec)
     out += ["## Recovery", "",
             f"A single node holding {rec[0].get('data_mb', '?')} MB on disk, killed with SIGKILL and",
-            "restarted, until it serves a read. Includes starting the container and the node's",
-            "first election timeout.", "",
+            "restarted: time from spawning the process until it serves a read. That includes",
+            "opening the LSM tree, replaying the WAL and the Raft log, and the first election",
+            "timeout (150-300 ms), which dominates.", "",
             "| Runs | median | max |", "|---:|---:|---:|",
             f"| {len(times)} | {statistics.median(times):.0f} ms | {times[-1]:.0f} ms |", ""]
 
