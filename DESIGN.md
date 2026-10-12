@@ -382,6 +382,138 @@ turn it back into a voter.
 | Real cluster: 2,000 writes with a 100-entry threshold, then a full restart | log stays within 110 entries of the snapshot; data intact |
 | Real cluster: 200 GETs | the leader's last log index does not move |
 
+## Fault injection and linearizability checking (M7)
+
+Unit tests and the simulator exercise the Raft core; this milestone attacks the real
+binary, over real TCP, with real disks, and checks what clients observed.
+
+```
+ kvhistory (8 clients) ──► 3-node Docker cluster ◄── chaos/run.sh: kill -9, iptables,
+      │ invoke/return times                            tc netem, wipe, libfaketime
+      ▼
+ history.jsonl ──► Porcupine (per-key register model) ──► linearizable / violation + HTML
+```
+
+**The history.** Eight concurrent clients issue random GETs, PUTs and DELETEs over ten
+keys, recording each operation's invoke and return time. Every written value is unique,
+so a read pins down exactly which write it observed. A write that timed out or lost its
+node has an unknown outcome: it may have been applied at any point after its call, or
+never. The checker models that by letting it return at infinity. Reads go to a random
+node (see bug log #12), so a node that answers from stale state is exercised, not just
+the leader.
+
+**The checker** is Porcupine with a register model, partitioned by key. Keys are
+independent registers, and checking each key's sub-history separately keeps the search
+exponential only in per-key concurrency. A typical 30,000-operation history checks in
+well under a second. Its own unit tests feed it legal histories and four kinds of
+illegal ones (stale read, a value from nowhere, a resurrected write, an out-of-order
+write) before it is trusted with anything.
+
+**Faults** (`chaos/run.sh`; each scenario reruns from a seed):
+
+| Scenario | Injection |
+|---|---|
+| Leader crash | `docker kill -s KILL` the leader mid-write, twice, restarting it each time |
+| Follower crash and restart | kill a follower, wait 10 s, restart it with its data |
+| Minority partition | `iptables` drops all traffic between one follower and the others |
+| Leader on the minority side | the same, applied to the leader |
+| Flapping partition | heal and isolate a random node every 2 s for 60 s |
+| Slow network | `tc netem delay 300ms 200ms` on every node (100 to 500 ms per hop) |
+| Packet loss | `tc netem loss 10%` on every node |
+| Data wipe | stop a follower, delete its data, restart it with `--join` after the leader has compacted |
+| Clock skew | node3 runs under libfaketime at 2x clock speed; the leader is cut off twice to force elections |
+
+The chaos cluster runs with 50 ms ticks (750 to 1500 ms election timeouts). The election
+timeout has to exceed the worst round trip the network will produce, and the
+slow-network scenario injects up to a second of it; at the default 150 to 300 ms the
+cluster would hold elections continuously, which is correct behavior but not a useful
+test.
+
+**Validating the harness.** A harness that never reports a failure proves nothing, so
+each fault was checked to have actually happened:
+
+| Check | Evidence |
+|---|---|
+| A broken server is caught | `UNSAFE=1` starts nodes that answer GETs from local state with no ReadIndex. Porcupine reports the history illegal and writes a visualization of the violation |
+| The wiped node really rebuilt from a snapshot | its status after the run shows `snapshots_installed=1`, `joined=1`, and the same apply hash as the other two |
+| The clock skew was real | node3's Raft tick counter ends at 2.00x node1's; a run where the ratio is under 1.6 is reported inconclusive, not passed |
+| The network faults bit | throughput drops from ~30,000 operations per run to ~15,000 to 20,000 under netem, and the flapping run moves through a dozen terms |
+
+**Results** (`chaos/matrix.sh 1 20`, every scenario with seeds 1 to 20):
+
+| Scenario | Runs | Linearizable | Violations | Inconclusive | Operations checked |
+|---|---:|---:|---:|---:|---:|
+| leader-crash | 20 | 20 | 0 | 0 | 531207 |
+| follower-restart | 20 | 20 | 0 | 0 | 481514 |
+| minority-partition | 20 | 20 | 0 | 0 | 463657 |
+| leader-minority | 20 | 20 | 0 | 0 | 435379 |
+| flapping-partition | 20 | 20 | 0 | 0 | 312578 |
+| slow-network | 20 | 20 | 0 | 0 | 325159 |
+| packet-loss | 20 | 20 | 0 | 0 | 387237 |
+| data-wipe | 20 | 20 | 0 | 0 | 937289 |
+| clock-skew | 20 | 20 | 0 | 0 | 468751 |
+| **Total** | **180** | **180** | **0** | **0** | **4,342,771** |
+
+Zero linearizability violations in 180 runs and 4,342,771 client operations. Every
+run's history, harness log and verdict is reproducible from its scenario and seed.
+
+## Kubernetes, mutual TLS and metrics (M8)
+
+**Mutual TLS on the event loop.** With `--tls_*` set, every connection (peer or client)
+completes a TLS 1.3 handshake in which *both* sides present a certificate signed by the
+cluster CA; anything else is refused before a single frame is read. The non-blocking
+server is where this gets subtle. OpenSSL may need to write in order to make progress on
+a read (handshakes, TLS 1.3 key updates) and to read in order to write, so each
+connection is a small state machine around `SSL_ERROR_WANT_READ` and
+`SSL_ERROR_WANT_WRITE`, and `EPOLLOUT` is armed whenever OpenSSL asks to write, not only
+when the response buffer is non-empty. One more case: if a handshake completes on a
+*writable* event, the client's first request may already sit decrypted in OpenSSL's
+buffer, and a level-triggered epoll will never report the socket readable for it. The
+server reads immediately after a handshake completes for that reason.
+
+Peers are authenticated by CA membership alone, with no hostname check: every node and
+operator client holds a certificate from the same private CA, so a valid certificate is
+the identity. Per-node identities checked against `--peers` are the next step if the CA
+were shared with anything else.
+
+**Metrics without a metrics library.** The spec suggests prometheus-cpp. It would bring
+civetweb and three more dependencies to produce what is about 150 lines of text
+formatting, and Kubernetes probes need an HTTP endpoint anyway. So a small registry
+(counters and histograms as relaxed atomics, gauges read at scrape time) renders the
+Prometheus text format, and one tiny admin server on port 9100 serves `/metrics`,
+`/healthz` and `/readyz`, away from the data-path event loops. A node is ready once it
+knows a leader and is not rejoining after a wipe. Highlights: request counts by
+operation and result, latency histograms, the leader, term, commit and applied indexes,
+proposals per log append (batching), mean Raft log `fsync` time, LSM table count and
+compactions, refused TLS handshakes, and peer messages dropped.
+
+**The Helm chart** (`deploy/helm/kvstore`) has three choices that each prevent a
+specific failure:
+
+- `podManagementPolicy: Parallel`. The default starts pod 0, waits for it to be Ready,
+  then starts pod 1. But pod 0 cannot be Ready until a leader exists, which needs a
+  majority running: a deadlock on first install.
+- The headless service sets `publishNotReadyAddresses`. Peers find each other through
+  it, and they need to do so *before* any of them is Ready, for the same reason.
+- The cluster CA and certificate are generated by Helm on first install and looked up
+  and reused on every upgrade. Regenerating them would leave running nodes holding
+  certificates from a CA nobody trusts any more. (The spec suggests a certificate Job;
+  Helm's built-in `genCA` with `lookup` does the same with no extra image and no RBAC to
+  write Secrets.)
+
+Also: a PodDisruptionBudget of one, so a drain never takes the quorum; preferred
+anti-affinity so a Kubernetes node failure costs one vote; non-root, read-only root
+filesystem, no capabilities. The node id comes from the StatefulSet ordinal
+(`kvstore-0` is node 1).
+
+**The end-to-end test** (`deploy/k8s/e2e.sh`) runs kind, kubectl and helm from a tools
+container, so the host needs only Docker. On a four-node kind cluster it installs the
+chart and checks: exactly one leader; reads and writes over mutual TLS; a client without
+a certificate is refused; deleting the leader pod elects a new leader and the recreated
+pod has the data; a rolling restart (every pod gets a new IP) rejoins; Prometheus
+scrapes all three nodes; a `helm upgrade` keeps the CA. Trivy reports no critical or
+high vulnerabilities in the image, and CI fails on any critical one.
+
 ## Java SDK and benchmarks (M9)
 
 **The Java client** (`client-java/`, Java 21, no dependencies) mirrors the C++ client's
@@ -454,4 +586,8 @@ share a container and the clock starts at process spawn (232 to 316 ms).
 | 8 | M6 | A wiped follower never caught up; the leader resent the same append forever | The leader clamps its retry point to `match + 1`, assuming follower logs never shrink. A wiped disk breaks that. A rejection now lowers `match`, which is always safe | Simulator |
 | 9 | M6 | Randomized snapshot runs took seconds each and looked hung | Each heartbeat resent the current snapshot chunk, and the ack for every resend started another chain of chunks, so concurrent transfers multiplied for as long as the snapshot was in flight. Now strictly stop-and-wait: only an ack that advances the offset sends more, and retransmission waits for a timeout | A hung test, then simulator message tracing |
 | 10 | M6 | State machine safety violation: "index 178 applied as term 2 elsewhere but term 3 on node 2" | A wiped node in join mode crashed and restarted before catching up; join mode was a startup flag, so it came back as a voter with an empty log and helped elect a leader missing committed entries. The joining flag is now persisted with the term and vote | Simulator |
+| 11 | M7 | The clock-skew scenario passed without skewing anything: node3 ticked exactly as often as node1 | Two causes. libfaketime 0.9.10 leaves `CLOCK_MONOTONIC` alone by default, and `steady_clock` reads it. With monotonic faking on, the Raft loop's condition-variable `wait_until` hung forever, because `pthread_cond_clockwait` is not intercepted. Fixed by faking the monotonic clock, replacing the condvar with an eventfd and `poll()` (which libfaketime scales), and having the harness assert node3's tick rate (now 2.00x) | Checking that the fault happened |
+| 12 | M7 | A deliberately broken server (stale local reads) passed the linearizability check | The recorder sent every read to the leader, so stale followers were never asked. CheckQuorum also shrinks a deposed leader's window to under a second, during which no newer write can commit. Reads now go to a random node; the broken server is flagged at once | Negative control |
+| 13 | M8 | On Kubernetes, a node that restarted during a rolling update never rejoined; the leader reported no dropped messages | The pod came back with a new IP. The other nodes' TCP connections still pointed at the old one, and writes to an address that no longer exists are neither refused nor reset: they are buffered and retransmitted for about 15 minutes. Outbound sockets now set `TCP_USER_TIMEOUT` (3 s) and keepalives, so the dead connection fails fast and the next dial re-resolves DNS. Compose never showed it: fixed IPs survive a restart | kind end-to-end test |
+| 14 | M8 | The TLS cluster test died with `SIGPIPE` | OpenSSL writes with `write(2)`, which cannot take `MSG_NOSIGNAL`, so writing to a peer that just closed raised `SIGPIPE`, whose default action kills the process. A node with TLS on could have been taken down by any peer restart. `SIGPIPE` is now ignored once TLS is configured | Full test suite under all three build modes |
 | 15 | M9 | Java integration test: 911 of 3,200 read-your-writes checks failed with 16 threads sharing one client, and a write acknowledged during a failover was missing | The server deduplicates retries by each session's highest applied sequence number, which assumes one write in flight per session. Concurrent writes on one session could commit out of order, and the lower one was acknowledged as a duplicate without being applied. The Java client now gives each in-flight write its own session lane, and the protocol header states the contract | Java SDK integration test |
