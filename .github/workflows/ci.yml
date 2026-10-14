@@ -111,3 +111,12 @@ jobs:
           curl -fsSL https://get.helm.sh/helm-v3.16.1-linux-amd64.tar.gz | tar -xz -C /tmp
           /tmp/linux-amd64/helm lint deploy/helm/kvstore
           /tmp/linux-amd64/helm template test deploy/helm/kvstore > /dev/null
+
+  java:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the server image
+        run: docker build -t kvstore:dev -f deploy/docker/Dockerfile .
+      - name: Java SDK against a live 3-node cluster (includes a leader failover)
+        run: client-java/run-it.sh

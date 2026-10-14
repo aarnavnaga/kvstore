@@ -11,6 +11,12 @@
 // already applied and answer it without applying it twice. Without that, a client that
 // times out and retries could make an old value reappear after a newer one.
 //
+// Contract: a client_id has at most one write in flight at a time, and seq increases by
+// one per new write. The server only remembers each session's highest applied seq, so two
+// concurrent writes on one session could commit out of order and the lower one would be
+// acknowledged as a "duplicate" without being applied. Concurrent clients use one session
+// per in-flight write (the Java SDK's session lanes).
+//
 // A NotLeader response carries the leader's client address (if known) as the hint, so a
 // client can retry there directly instead of probing every node.
 

@@ -1,0 +1,33 @@
+# 3-node cluster for local development, SDK integration tests and benchmarks.
+#   docker compose -f deploy/compose/cluster3.yml up -d
+x-node: &node
+  image: ${KV_IMAGE:-kvstore:dev}
+  restart: "no"
+x-env: &env
+  KV_PEERS: "1=node1:7000,2=node2:7000,3=node3:7000"
+  KV_DATA: /data
+  KV_TICK_MS: "10"
+  KV_EXTRA_ARGS: ${KV_EXTRA_ARGS:-}
+services:
+  node1:
+    <<: *node
+    hostname: node1
+    environment: { <<: *env, KV_ID: "1" }
+    volumes: [node1:/data]
+    expose: ["7000"]
+  node2:
+    <<: *node
+    hostname: node2
+    environment: { <<: *env, KV_ID: "2" }
+    volumes: [node2:/data]
+    expose: ["7000"]
+  node3:
+    <<: *node
+    hostname: node3
+    environment: { <<: *env, KV_ID: "3" }
+    volumes: [node3:/data]
+    expose: ["7000"]
+volumes:
+  node1: {}
+  node2: {}
+  node3: {}

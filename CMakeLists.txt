@@ -12,6 +12,7 @@ endif()
 
 option(KV_BUILD_TESTS "Build unit and integration tests" ON)
 option(KV_BUILD_FUZZ "Build libFuzzer targets (clang only)" OFF)
+option(KV_BUILD_BENCH "Build the benchmark tools (fetches HdrHistogram)" ON)
 set(KV_SANITIZER "" CACHE STRING "Sanitizer to build with: address, thread or empty")
 
 add_compile_options(-Wall -Wextra -Wpedantic -Wno-missing-field-initializers -Werror=return-type)
@@ -52,4 +53,8 @@ endif()
 
 if(KV_BUILD_FUZZ)
   add_subdirectory(fuzz)
+endif()
+
+if(KV_BUILD_BENCH AND NOT KV_BUILD_FUZZ)
+  add_subdirectory(bench)
 endif()
